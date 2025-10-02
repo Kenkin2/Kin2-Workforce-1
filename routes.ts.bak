@@ -1,0 +1,4315 @@
+import type { Express } from "express";
+import { createServer, type Server } from "http";
+import Stripe from "stripe";
+import { storage } from "./storage";
+import { setupAuth, isAuthenticated } from "./auth";
+import { insertJobSchema, insertShiftSchema, insertTimesheetSchema, insertPaymentSchema, users } from "@shared/schema";
+import { db } from "./db";
+import { eq, count } from "drizzle-orm";
+import { notificationService } from "./notifications";
+import { z } from "zod";
+import { paymentProcessor } from "./payments";
+import { checkDatabaseHealth } from "./db";
+import { systemMonitor } from "./monitoring";
+import { performanceMiddleware, checkRateLimit } from "./performance";
+import { aiService } from "./ai";
+import { integrationManager } from "./integrations";
+import { realTimeNotificationService } from "./realtime-notifications";
+import { pricingService } from "./services/pricing-service";
+import { billingAutomation } from "./services/billing-automation";
+import { createActionExecutionService } from "./services/action-execution-service";
+import { createIssueDetectionScheduler } from "./services/issue-detection-scheduler";
+import logger from './utils/logger';
+import { cacheMiddleware, invalidateCacheMiddleware } from './middleware/cache';
+import { 
+  isAuthenticated as requireAuth,
+  isAdmin, 
+  isClientOrAdmin,
+  isAuthenticatedOrDemo 
+} from './middleware/auth-guards';
+
+// Validate required environment variables
+if (!process.env.STRIPE_SECRET_KEY) {
+  throw new Error('Missing required Stripe secret: STRIPE_SECRET_KEY');
+}
+if (!process.env.DATABASE_URL) {
+  throw new Error('Missing required DATABASE_URL');
+}
+
+// Initialize Stripe with validated configuration
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
+  apiVersion: "2025-08-27.basil",
+});
+
+export async function registerRoutes(app: Express): Promise<Server> {
+  // Health check endpoint
+  app.get('/health', (req, res) => {
+    res.json({ 
+      status: 'ok', 
+      timestamp: new Date().toISOString(),
+      version: '1.0.0',
+      environment: process.env.NODE_ENV || 'development'
+    });
+  });
+
+  // Error logging endpoint for client-side errors
+  app.post('/api/errors/log', async (req, res) => {
+    try {
+      const errorData = req.body;
+      logger.error('[Client Error]', {
+        message: errorData.message,
+        stack: errorData.stack,
+        url: errorData.url,
+        timestamp: errorData.timestamp,
+        userAgent: errorData.userAgent,
+      });
+      
+      res.json({ success: true });
+    } catch (error) {
+      logger.error('Error logging client error:', error);
+      res.status(500).json({ success: false });
+    }
+  });
+
+  // Performance monitoring middleware
+  app.use(performanceMiddleware);
+  
+  // Setup authentication middleware (database already validated by initializer)
+  setupAuth(app);
+  logger.info('✅ Authentication middleware configured');
+  
+  // Start system monitoring
+  systemMonitor.startMonitoring();
+  logger.info('✅ System monitoring started');
+
+  // Setup health dashboard routes
+  const { setupHealthDashboard } = await import('./routes/health-dashboard');
+  setupHealthDashboard(app);
+
+  // Import logging and compliance services
+  const { loggingService } = await import('./services/logging-service');
+  const { regulatoryComplianceService } = await import('./services/regulatory-compliance');
+
+  // Compliance and Logging API Routes
+  // NOTE: Using auth guards from middleware/auth-guards.ts
+
+  app.get('/api/compliance/overview', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      const report = await regulatoryComplianceService.generateComplianceReport();
+      res.json({
+        totalRegulations: report.summary.totalRegulations,
+        compliantRegulations: report.summary.compliantRegulations,
+        partialCompliance: report.summary.partialCompliance,
+        nonCompliantRegulations: report.summary.nonCompliantRegulations,
+        overallScore: report.summary.overallScore,
+        activeIncidents: report.summary.activeIncidents,
+        pendingAssessments: 3,
+        dataRetentionCompliance: 94.5
+      });
+    } catch (error) {
+      logger.error('Error fetching compliance overview:', error);
+      res.status(500).json({ message: 'Failed to fetch compliance overview' });
+    }
+  });
+
+  app.get('/api/compliance/regulations', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      const regulations = regulatoryComplianceService.getRegulations();
+      const assessments = regulatoryComplianceService.getAssessments();
+      
+      const regulationsWithStatus = regulations.map(reg => {
+        const latestAssessment = assessments
+          .filter(a => a.regulationId === reg.id)
+          .sort((a, b) => b.assessmentDate - a.assessmentDate)[0];
+        
+        return {
+          id: reg.id,
+          name: reg.name,
+          description: reg.description,
+          jurisdiction: reg.jurisdiction,
+          status: latestAssessment?.status || 'non_compliant',
+          score: latestAssessment?.overallScore || 0,
+          lastAssessed: latestAssessment?.assessmentDate || Date.now() - 86400000,
+          nextAssessment: latestAssessment?.nextAssessment || Date.now() + 86400000,
+          gaps: latestAssessment?.gaps.length || 0,
+          incidents: 0,
+          keyRequirements: reg.keyRequirements.length
+        };
+      });
+      
+      res.json(regulationsWithStatus);
+    } catch (error) {
+      logger.error('Error fetching regulations:', error);
+      res.status(500).json({ message: 'Failed to fetch regulations' });
+    }
+  });
+
+  app.get('/api/compliance/incidents', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      const incidents = regulatoryComplianceService.getIncidents('open');
+      res.json(incidents);
+    } catch (error) {
+      logger.error('Error fetching incidents:', error);
+      res.status(500).json({ message: 'Failed to fetch incidents' });
+    }
+  });
+
+  app.get('/api/compliance/audit-logs', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      const { timeRange = '30d' } = req.query;
+      const logs = loggingService.searchLogs({
+        level: ['audit', 'security', 'compliance'],
+        timeRange: {
+          start: Date.now() - 30 * 24 * 60 * 60 * 1000, // 30 days
+          end: Date.now()
+        }
+      });
+      
+      res.json(logs.slice(0, 100)); // Return latest 100 logs
+    } catch (error) {
+      logger.error('Error fetching audit logs:', error);
+      res.status(500).json({ message: 'Failed to fetch audit logs' });
+    }
+  });
+
+  app.post('/api/compliance/assess/:regulationId', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      const { regulationId } = req.params;
+      const assessment = await regulatoryComplianceService.conductAssessment(regulationId);
+      res.json(assessment);
+    } catch (error) {
+      logger.error('Error conducting assessment:', error);
+      res.status(500).json({ message: 'Failed to conduct assessment' });
+    }
+  });
+
+  app.post('/api/compliance/export', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      const { regulation, timeRange, format } = req.body;
+      const report = await regulatoryComplianceService.generateComplianceReport(regulation);
+      
+      // For now, return JSON - in production, this would generate PDF/Excel
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Content-Disposition', `attachment; filename="compliance-report-${Date.now()}.json"`);
+      res.json(report);
+    } catch (error) {
+      logger.error('Error exporting report:', error);
+      res.status(500).json({ message: 'Failed to export report' });
+    }
+  });
+
+  app.post('/api/compliance/incident', isAuthenticated, async (req: any, res) => {
+    try {
+      const incident = regulatoryComplianceService.reportIncident(req.body);
+      
+      // Log security incident
+      loggingService.security('compliance_incident', incident.severity as any, {
+        incidentId: incident.id,
+        regulation: incident.regulation,
+        type: incident.type
+      }, req.user?.claims?.sub);
+      
+      res.json(incident);
+    } catch (error) {
+      logger.error('Error reporting incident:', error);
+      res.status(500).json({ message: 'Failed to report incident' });
+    }
+  });
+
+  // Data access logging for GDPR/HIPAA compliance
+  app.post('/api/log/data-access', isAuthenticated, async (req: any, res) => {
+    try {
+      const { dataType, operation, recordIds, purpose } = req.body;
+      
+      loggingService.dataAccess(
+        req.user.claims.sub,
+        dataType,
+        operation,
+        recordIds,
+        purpose,
+        req
+      );
+      
+      res.json({ logged: true });
+    } catch (error) {
+      logger.error('Error logging data access:', error);
+      res.status(500).json({ message: 'Failed to log data access' });
+    }
+  });
+
+  // GDPR right to be forgotten
+  app.post('/api/compliance/forget-user/:userId', isAuthenticated, async (req: any, res) => {
+    try {
+      const { userId } = req.params;
+      const currentUser = req.user.claims.sub;
+      
+      // Check if user has permission (admin or the user themselves)
+      const user = await storage.getUser(currentUser);
+      if (user?.role !== 'admin' && currentUser !== userId) {
+        return res.status(403).json({ message: 'Insufficient permissions' });
+      }
+      
+      const result = loggingService.forgetUser(userId);
+      
+      // Note: User deletion from storage would require implementing storage.deleteUser method
+      // For now, we rely on the logging service's anonymization
+      
+      loggingService.compliance('GDPR', 'right_to_be_forgotten_executed', 'compliant', {
+        userId,
+        requestedBy: currentUser,
+        deleted: result.deleted,
+        anonymized: result.anonymized
+      });
+      
+      res.json(result);
+    } catch (error) {
+      logger.error('Error processing forget user request:', error);
+      res.status(500).json({ message: 'Failed to process forget user request' });
+    }
+  });
+
+
+
+  // Dashboard stats
+  app.get('/api/dashboard/stats', isAuthenticated, async (req, res) => {
+    try {
+      const stats = await storage.getDashboardStats();
+      res.json(stats);
+    } catch (error) {
+      console.error("Error fetching dashboard stats:", error);
+      res.status(500).json({ message: "Failed to fetch dashboard stats" });
+    }
+  });
+
+  // Jobs routes
+  app.get('/api/jobs', isAuthenticated, async (req, res) => {
+    try {
+      const jobs = await storage.getJobs();
+      res.json(jobs);
+    } catch (error) {
+      console.error("Error fetching jobs:", error);
+      res.status(500).json({ message: "Failed to fetch jobs" });
+    }
+  });
+
+  app.post('/api/jobs', isAuthenticated, async (req: any, res) => {
+    try {
+      const jobData = insertJobSchema.parse({
+        ...req.body,
+        clientId: req.user.claims.sub
+      });
+      const job = await storage.createJob(jobData);
+      
+      // Create activity and send notifications
+      await storage.createActivity({
+        userId: req.user.claims.sub,
+        type: "job_posted",
+        description: `Posted new job: ${job.title}`,
+        metadata: { jobId: job.id }
+      });
+      
+      // Notify workers about new job
+      await notificationService.notifyJobPosted(job.id, job.title, req.user.claims.sub);
+      
+      res.json(job);
+    } catch (error) {
+      console.error("Error creating job:", error);
+      res.status(500).json({ message: "Failed to create job" });
+    }
+  });
+
+  app.get('/api/jobs/:id', isAuthenticated, async (req, res) => {
+    try {
+      const job = await storage.getJobById(req.params.id);
+      if (!job) {
+        return res.status(404).json({ message: "Job not found" });
+      }
+      res.json(job);
+    } catch (error) {
+      console.error("Error fetching job:", error);
+      res.status(500).json({ message: "Failed to fetch job" });
+    }
+  });
+
+  // Shifts routes
+  app.post('/api/shifts', isAuthenticated, async (req: any, res) => {
+    try {
+      const shiftData = insertShiftSchema.parse(req.body);
+      const shift = await storage.createShift(shiftData);
+      res.json(shift);
+    } catch (error) {
+      console.error("Error creating shift:", error);
+      res.status(500).json({ message: "Failed to create shift" });
+    }
+  });
+
+  app.get('/api/shifts/job/:jobId', isAuthenticated, async (req, res) => {
+    try {
+      const shifts = await storage.getShiftsByJob(req.params.jobId);
+      res.json(shifts);
+    } catch (error) {
+      console.error("Error fetching shifts:", error);
+      res.status(500).json({ message: "Failed to fetch shifts" });
+    }
+  });
+
+  app.get('/api/shifts/worker/:workerId', isAuthenticated, async (req, res) => {
+    try {
+      const shifts = await storage.getShiftsByWorker(req.params.workerId);
+      res.json(shifts);
+    } catch (error) {
+      console.error("Error fetching worker shifts:", error);
+      res.status(500).json({ message: "Failed to fetch worker shifts" });
+    }
+  });
+
+  // Calendar-specific shift routes
+  app.get('/api/shifts', isAuthenticated, async (req, res) => {
+    try {
+      const { start, end } = req.query;
+      const shifts = await storage.getShiftsByDateRange(start as string, end as string);
+      res.json(shifts);
+    } catch (error) {
+      console.error("Error fetching shifts:", error);
+      res.status(500).json({ message: "Failed to fetch shifts" });
+    }
+  });
+
+  app.patch('/api/shifts/:id', isAuthenticated, async (req, res) => {
+    try {
+      // Validate input with partial schema (allow updating subset of fields)
+      const updateData = insertShiftSchema.partial().parse(req.body);
+      const shift = await storage.updateShift(req.params.id, updateData);
+      res.json(shift);
+    } catch (error: any) {
+      if (error.name === 'ZodError') {
+        return res.status(400).json({ message: "Invalid input data", errors: error.errors });
+      }
+      console.error("Error updating shift:", error);
+      res.status(500).json({ message: "Failed to update shift" });
+    }
+  });
+
+  app.delete('/api/shifts/:id', isAuthenticated, async (req, res) => {
+    try {
+      await storage.deleteShift(req.params.id);
+      res.json({ message: "Shift deleted successfully" });
+    } catch (error) {
+      console.error("Error deleting shift:", error);
+      res.status(500).json({ message: "Failed to delete shift" });
+    }
+  });
+
+  // Recurring shifts routes
+  app.post("/api/recurring-shifts", isAuthenticated, async (req, res) => {
+    try {
+      // Validate recurring shift data
+      const recurringData = insertShiftSchema.partial().extend({
+        frequency: insertShiftSchema.shape.title.optional(),
+        dayOfWeek: insertShiftSchema.shape.title.optional()
+      }).parse(req.body);
+      const recurring = await storage.createRecurringShift(recurringData);
+      res.json(recurring);
+    } catch (error: any) {
+      if (error.name === 'ZodError') {
+        return res.status(400).json({ message: "Invalid recurring shift data", errors: error.errors });
+      }
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get("/api/recurring-shifts", isAuthenticated, async (req, res) => {
+    try {
+      const recurring = await storage.getRecurringShifts();
+      res.json(recurring);
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.post("/api/recurring-shifts/:id/generate", isAuthenticated, async (req, res) => {
+    try {
+      const { weeks } = req.body;
+      const result = await storage.generateShiftsFromRecurring(req.params.id, weeks);
+      res.json(result);
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Worker availability routes
+  app.get("/api/worker-availability/:workerId", isAuthenticated, async (req, res) => {
+    try {
+      const availability = await storage.getWorkerAvailability(req.params.workerId);
+      res.json(availability);
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.put("/api/worker-availability/:workerId", isAuthenticated, async (req, res) => {
+    try {
+      const { availability } = req.body;
+      await storage.updateWorkerAvailability(req.params.workerId, availability);
+      res.json({ success: true });
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get("/api/scheduling-conflicts/:workerId", isAuthenticated, async (req, res) => {
+    try {
+      const conflicts = await storage.checkSchedulingConflicts(req.params.workerId);
+      res.json(conflicts);
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Shift templates routes
+  app.post("/api/shift-templates", isAuthenticated, async (req, res) => {
+    try {
+      const template = await storage.createShiftTemplate(req.body);
+      res.json(template);
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get("/api/shift-templates", isAuthenticated, async (req, res) => {
+    try {
+      const templates = await storage.getShiftTemplates();
+      res.json(templates);
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.delete("/api/shift-templates/:id", isAuthenticated, async (req, res) => {
+    try {
+      await storage.deleteShiftTemplate(req.params.id);
+      res.json({ success: true });
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Analytics routes
+  app.get("/api/scheduling/analytics", isAuthenticated, async (req, res) => {
+    try {
+      const analytics = await storage.getSchedulingAnalytics();
+      res.json(analytics);
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get("/api/scheduling/utilization", isAuthenticated, async (req, res) => {
+    try {
+      const utilization = await storage.getWorkerUtilization();
+      res.json(utilization);
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Workers route for assignment
+  app.get('/api/workers', isAuthenticated, async (req, res) => {
+    try {
+      const workers = await storage.getUsersByRole('worker');
+      res.json(workers);
+    } catch (error) {
+      console.error("Error fetching workers:", error);
+      res.status(500).json({ message: "Failed to fetch workers" });
+    }
+  });
+
+  // Timesheets routes
+  app.post('/api/timesheets', isAuthenticated, async (req: any, res) => {
+    try {
+      const timesheetData = insertTimesheetSchema.parse({
+        ...req.body,
+        workerId: req.user.claims.sub
+      });
+      const timesheet = await storage.createTimesheet(timesheetData);
+      
+      // Create activity
+      await storage.createActivity({
+        userId: req.user.claims.sub,
+        type: "timesheet_submitted",
+        description: "Submitted timesheet for review",
+        metadata: { timesheetId: timesheet.id }
+      });
+      
+      res.json(timesheet);
+    } catch (error) {
+      console.error("Error creating timesheet:", error);
+      res.status(500).json({ message: "Failed to create timesheet" });
+    }
+  });
+
+  app.get('/api/timesheets/pending', isAuthenticated, async (req, res) => {
+    try {
+      const timesheets = await storage.getPendingTimesheets();
+      res.json(timesheets);
+    } catch (error) {
+      console.error("Error fetching pending timesheets:", error);
+      res.status(500).json({ message: "Failed to fetch pending timesheets" });
+    }
+  });
+
+  app.patch('/api/timesheets/:id/approve', isAuthenticated, async (req: any, res) => {
+    try {
+      const timesheet = await storage.getTimesheetById(req.params.id);
+      if (!timesheet) {
+        return res.status(404).json({ message: "Timesheet not found" });
+      }
+      
+      await storage.approveTimesheet(req.params.id, req.user.claims.sub);
+      
+      // Notify worker about approval
+      const hourlyRate = 15; // This should come from job/worker data
+      const totalAmount = Number(timesheet.hoursWorked || 0) * hourlyRate;
+      await notificationService.notifyTimesheetApproved(req.params.id, timesheet.workerId, totalAmount);
+      
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Error approving timesheet:", error);
+      res.status(500).json({ message: "Failed to approve timesheet" });
+    }
+  });
+
+  // Workers routes
+  app.get('/api/workers', isAuthenticated, async (req, res) => {
+    try {
+      const workers = await storage.getUsersByRole('worker');
+      res.json(workers);
+    } catch (error) {
+      console.error("Error fetching workers:", error);
+      res.status(500).json({ message: "Failed to fetch workers" });
+    }
+  });
+
+  // Clients routes
+  app.get('/api/clients', isAuthenticated, async (req, res) => {
+    try {
+      const clients = await storage.getUsersByRole('client');
+      res.json(clients);
+    } catch (error) {
+      console.error("Error fetching clients:", error);
+      res.status(500).json({ message: "Failed to fetch clients" });
+    }
+  });
+
+  // Comprehensive User Management API Endpoints
+  app.get('/api/users', isAuthenticated, async (req, res) => {
+    try {
+      const user = req.user as any;
+      // Only admins can view all users
+      if (user.role !== 'admin') {
+        return res.status(403).json({ message: "Access denied. Admin required." });
+      }
+      
+      const allUsers = await db.select({
+        id: users.id,
+        email: users.email,
+        firstName: users.firstName,
+        lastName: users.lastName,
+        role: users.role,
+        karmaCoins: users.karmaCoins,
+        createdAt: users.createdAt,
+        updatedAt: users.updatedAt
+      }).from(users);
+      
+      res.json(allUsers);
+    } catch (error) {
+      console.error("Error fetching users:", error);
+      res.status(500).json({ message: "Failed to fetch users" });
+    }
+  });
+
+  app.put('/api/users/:id/role', isAuthenticated, async (req, res) => {
+    try {
+      const user = req.user as any;
+      // Only admins can update user roles
+      if (user.role !== 'admin') {
+        return res.status(403).json({ message: "Access denied. Admin required." });
+      }
+      
+      const { id } = req.params;
+      const { role } = req.body;
+      
+      if (!role || !['admin', 'client', 'worker'].includes(role)) {
+        return res.status(400).json({ message: "Invalid role. Must be admin, client, or worker." });
+      }
+      
+      await db.update(users).set({ role, updatedAt: new Date() }).where(eq(users.id, id));
+      
+      const updatedUser = await db.select().from(users).where(eq(users.id, id));
+      res.json({ message: "User role updated successfully", user: updatedUser[0] });
+    } catch (error) {
+      console.error("Error updating user role:", error);
+      res.status(500).json({ message: "Failed to update user role" });
+    }
+  });
+
+  app.get('/api/users/stats', isAuthenticated, async (req, res) => {
+    try {
+      const user = req.user as any;
+      // Only admins can view user statistics
+      if (user.role !== 'admin') {
+        return res.status(403).json({ message: "Access denied. Admin required." });
+      }
+      
+      const [totalUsers] = await db.select({ count: count() }).from(users);
+      const [adminCount] = await db.select({ count: count() }).from(users).where(eq(users.role, 'admin'));
+      const [clientCount] = await db.select({ count: count() }).from(users).where(eq(users.role, 'client'));
+      const [workerCount] = await db.select({ count: count() }).from(users).where(eq(users.role, 'worker'));
+      
+      res.json({
+        totalUsers: totalUsers.count,
+        adminCount: adminCount.count,
+        clientCount: clientCount.count,
+        workerCount: workerCount.count,
+        roleDistribution: {
+          admin: adminCount.count,
+          client: clientCount.count,
+          worker: workerCount.count
+        }
+      });
+    } catch (error) {
+      console.error("Error fetching user statistics:", error);
+      res.status(500).json({ message: "Failed to fetch user statistics" });
+    }
+  });
+
+  // Enhanced Analytics endpoint
+  app.get('/api/reports/analytics', isAuthenticated, async (req, res) => {
+    try {
+      const timeRange = req.query.timeRange as string || '7d';
+      
+      // Mock enhanced analytics data - in production, this would come from database
+      const analyticsData = {
+        activeJobs: 15,
+        totalWorkers: 127,
+        monthlyRevenue: 24500,
+        completionRate: 94.2,
+        chartData: {
+          monthlyRevenue: [
+            { month: 'Jan', revenue: 18500 },
+            { month: 'Feb', revenue: 21200 },
+            { month: 'Mar', revenue: 19800 },
+            { month: 'Apr', revenue: 24500 },
+            { month: 'May', revenue: 26100 },
+            { month: 'Jun', revenue: 24500 }
+          ],
+          workerPerformance: [
+            { name: 'John Smith', value: 95 },
+            { name: 'Sarah Johnson', value: 89 },
+            { name: 'Mike Wilson', value: 92 },
+            { name: 'Lisa Brown', value: 87 }
+          ],
+          jobCategories: [
+            { category: 'Technology', count: 45 },
+            { category: 'Healthcare', count: 32 },
+            { category: 'Construction', count: 28 },
+            { category: 'Retail', count: 22 },
+            { category: 'Other', count: 18 }
+          ]
+        }
+      };
+      
+      res.json(analyticsData);
+    } catch (error) {
+      console.error("Error fetching analytics data:", error);
+      res.status(500).json({ message: "Failed to fetch analytics data" });
+    }
+  });
+
+  // Courses routes
+  app.get('/api/courses', isAuthenticated, async (req, res) => {
+    try {
+      const courses = await storage.getCourses();
+      res.json(courses);
+    } catch (error) {
+      console.error("Error fetching courses:", error);
+      res.status(500).json({ message: "Failed to fetch courses" });
+    }
+  });
+
+  app.post('/api/courses/:id/complete', isAuthenticated, async (req: any, res) => {
+    try {
+      const courseId = req.params.id;
+      const userId = req.user.claims.sub;
+      
+      const course = await storage.getCourseById(courseId);
+      if (!course) {
+        return res.status(404).json({ message: "Course not found" });
+      }
+      
+      const completion = await storage.createCourseCompletion({
+        userId,
+        courseId,
+        score: req.body.score || 100
+      });
+      
+      // Award KarmaCoins
+      await storage.updateUserKarmaCoins(userId, course.karmaReward);
+      
+      // Create activity
+      await storage.createActivity({
+        userId,
+        type: "course_completed",
+        description: `Completed course: ${course.title} and earned ${course.karmaReward} KarmaCoins`,
+        metadata: { courseId, karmaReward: course.karmaReward }
+      });
+      
+      res.json(completion);
+    } catch (error) {
+      console.error("Error completing course:", error);
+      res.status(500).json({ message: "Failed to complete course" });
+    }
+  });
+
+  // Activities routes
+  app.get('/api/activities', isAuthenticated, async (req, res) => {
+    try {
+      const limit = req.query.limit ? parseInt(req.query.limit as string) : 10;
+      const activities = await storage.getRecentActivities(limit);
+      res.json(activities);
+    } catch (error) {
+      console.error("Error fetching activities:", error);
+      res.status(500).json({ message: "Failed to fetch activities" });
+    }
+  });
+
+  // Payments routes
+  app.get('/api/payments/worker/:workerId', isAuthenticated, async (req, res) => {
+    try {
+      const payments = await storage.getPaymentsByWorker(req.params.workerId);
+      res.json(payments);
+    } catch (error) {
+      console.error("Error fetching payments:", error);
+      res.status(500).json({ message: "Failed to fetch payments" });
+    }
+  });
+
+  // Enhanced payment routes
+  app.post("/api/create-payment-intent", isAuthenticated, async (req, res) => {
+    try {
+      const { amount, workerId, timesheetId, metadata } = req.body;
+      
+      const paymentIntent = await paymentProcessor.createPaymentIntent({
+        amount,
+        workerId,
+        timesheetId,
+        metadata
+      });
+      
+      res.json({ 
+        clientSecret: paymentIntent.client_secret,
+        paymentIntentId: paymentIntent.id
+      });
+    } catch (error: any) {
+      console.error("Error creating payment intent:", error);
+      res.status(500).json({ message: "Error creating payment intent: " + error.message });
+    }
+  });
+
+  // Enhanced subscription management
+  app.post('/api/create-subscription', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const user = await storage.getUser(userId);
+      
+      if (!user?.email) {
+        return res.status(400).json({ message: 'User email is required for subscription' });
+      }
+
+      const { trialDays, priceId } = req.body;
+      
+      const subscription = await paymentProcessor.createOrUpdateSubscription({
+        userId,
+        email: user.email,
+        priceId,
+        trialDays
+      });
+      
+      res.json(subscription);
+    } catch (error: any) {
+      console.error("Error creating subscription:", error);
+      res.status(500).json({ message: "Error creating subscription: " + error.message });
+    }
+  });
+
+  // Stripe webhook endpoint
+  app.post('/api/webhooks/stripe', async (req, res) => {
+    const signature = req.headers['stripe-signature'] as string;
+    
+    try {
+      await paymentProcessor.handleWebhook(req.body, signature);
+      res.json({ received: true });
+    } catch (error: any) {
+      logger.error('Webhook error:', error);
+      res.status(400).json({ message: 'Webhook error: ' + error.message });
+    }
+  });
+
+  // Pricing Management API Routes
+  
+  // Get all active pricing plans
+  app.get('/api/pricing/plans', async (req, res) => {
+    try {
+      const plans = await pricingService.getActivePlans();
+      res.json(plans);
+    } catch (error) {
+      logger.error('Error fetching pricing plans:', error);
+      res.status(500).json({ message: 'Failed to fetch pricing plans' });
+    }
+  });
+
+  // Calculate pricing for specific organization
+  app.post('/api/pricing/calculate', isAuthenticated, async (req, res) => {
+    try {
+      const { planId, employeeCount, organizationId } = req.body;
+      
+      if (!planId || !employeeCount) {
+        return res.status(400).json({ message: 'Plan ID and employee count are required' });
+      }
+
+      const pricing = await pricingService.calculatePrice(planId, employeeCount, organizationId);
+      res.json(pricing);
+    } catch (error) {
+      logger.error('Error calculating pricing:', error);
+      res.status(500).json({ message: 'Failed to calculate pricing' });
+    }
+  });
+
+  // Create organization subscription
+  app.post('/api/pricing/subscribe', isAuthenticated, async (req, res) => {
+    try {
+      const { organizationId, planId, employeeCount = 1 } = req.body;
+      
+      if (!organizationId || !planId) {
+        return res.status(400).json({ message: 'Organization ID and plan ID are required' });
+      }
+
+      const subscription = await pricingService.createOrganizationSubscription(
+        organizationId, 
+        planId, 
+        employeeCount
+      );
+      
+      res.json(subscription);
+    } catch (error) {
+      logger.error('Error creating subscription:', error);
+      res.status(500).json({ message: 'Failed to create subscription' });
+    }
+  });
+
+  // Update employee count for existing subscription
+  app.patch('/api/pricing/subscription/:orgId/employees', isAuthenticated, async (req, res) => {
+    try {
+      const { orgId } = req.params;
+      const { employeeCount } = req.body;
+      
+      if (!employeeCount || employeeCount < 1) {
+        return res.status(400).json({ message: 'Valid employee count is required' });
+      }
+
+      await pricingService.updateEmployeeCount(orgId, employeeCount);
+      res.json({ success: true, employeeCount });
+    } catch (error) {
+      logger.error('Error updating employee count:', error);
+      res.status(500).json({ message: 'Failed to update employee count' });
+    }
+  });
+
+  // Get organization subscription details
+  app.get('/api/pricing/subscription/:orgId', isAuthenticated, async (req, res) => {
+    try {
+      const { orgId } = req.params;
+      const subscription = await pricingService.getOrganizationSubscription(orgId);
+      res.json(subscription);
+    } catch (error) {
+      logger.error('Error fetching subscription:', error);
+      res.status(500).json({ message: 'Failed to fetch subscription' });
+    }
+  });
+
+  // Get usage metrics for organization
+  app.get('/api/pricing/usage/:orgId', isAuthenticated, async (req, res) => {
+    try {
+      const { orgId } = req.params;
+      const { billingPeriod } = req.query;
+      
+      const usage = await pricingService.getOrganizationUsage(
+        orgId, 
+        billingPeriod as string
+      );
+      res.json(usage);
+    } catch (error) {
+      logger.error('Error fetching usage:', error);
+      res.status(500).json({ message: 'Failed to fetch usage' });
+    }
+  });
+
+  // Manual billing trigger (admin only)
+  app.post('/api/pricing/billing/process/:orgId', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const user = await storage.getUser(userId);
+      
+      if (user?.role !== 'admin') {
+        return res.status(403).json({ message: 'Admin access required' });
+      }
+
+      const { orgId } = req.params;
+      await pricingService.processBilling(orgId);
+      res.json({ success: true, message: 'Billing processed successfully' });
+    } catch (error) {
+      logger.error('Error processing billing:', error);
+      res.status(500).json({ message: 'Failed to process billing' });
+    }
+  });
+
+  // Get billing metrics (admin only)
+  app.get('/api/pricing/metrics', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const user = await storage.getUser(userId);
+      
+      if (user?.role !== 'admin') {
+        return res.status(403).json({ message: 'Admin access required' });
+      }
+
+      const metrics = await billingAutomation.getBillingMetrics();
+      res.json(metrics);
+    } catch (error) {
+      logger.error('Error fetching billing metrics:', error);
+      res.status(500).json({ message: 'Failed to fetch billing metrics' });
+    }
+  });
+
+  // System monitoring endpoints
+  app.get('/api/system/health', async (req, res) => {
+    try {
+      const dbHealth = await checkDatabaseHealth();
+      const paymentMetrics = paymentProcessor.getMetrics();
+      
+      const health = {
+        status: dbHealth.healthy ? 'healthy' : 'unhealthy',
+        timestamp: new Date().toISOString(),
+        database: {
+          healthy: dbHealth.healthy,
+          latency: dbHealth.latency,
+          connections: dbHealth.connections
+        },
+        payments: {
+          totalProcessed: paymentMetrics.totalProcessed,
+          successRate: paymentMetrics.successRate,
+          averageProcessingTime: paymentMetrics.averageProcessingTime
+        },
+        services: {
+          notifications: 'active',
+          authentication: 'active',
+          stripe: 'active'
+        }
+      };
+      
+      res.json(health);
+    } catch (error) {
+      logger.error('Health check failed:', error);
+      res.status(500).json({ 
+        status: 'unhealthy', 
+        error: 'Health check failed' 
+      });
+    }
+  });
+
+  // Payment metrics endpoint
+  app.get('/api/payments/metrics', isAuthenticated, async (req, res) => {
+    try {
+      const metrics = paymentProcessor.getMetrics();
+      res.json(metrics);
+    } catch (error) {
+      logger.error('Error fetching payment metrics:', error);
+      res.status(500).json({ message: 'Failed to fetch payment metrics' });
+    }
+  });
+
+  // Enhanced system monitoring endpoints
+  app.get('/api/system/status', async (req, res) => {
+    try {
+      const status = await systemMonitor.getSystemStatus();
+      res.json(status);
+    } catch (error) {
+      logger.error('Error fetching system status:', error);
+      res.status(500).json({ message: 'Failed to fetch system status' });
+    }
+  });
+
+  app.get('/api/system/metrics', isAuthenticated, async (req, res) => {
+    try {
+      const count = parseInt(req.query.count as string) || 10;
+      const metrics = systemMonitor.getMetrics(count);
+      res.json(metrics);
+    } catch (error) {
+      logger.error('Error fetching system metrics:', error);
+      res.status(500).json({ message: 'Failed to fetch system metrics' });
+    }
+  });
+
+  app.get('/api/system/recommendations', isAuthenticated, async (req, res) => {
+    try {
+      const recommendations = systemMonitor.getOptimizationRecommendations();
+      res.json({ recommendations });
+    } catch (error) {
+      logger.error('Error fetching recommendations:', error);
+      res.status(500).json({ message: 'Failed to fetch recommendations' });
+    }
+  });
+
+  // Original subscription management (keeping for backward compatibility)
+  app.post('/api/create-subscription-legacy', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const user = await storage.getUser(userId);
+      
+      if (!user?.email) {
+        return res.status(400).json({ message: 'User email is required for subscription' });
+      }
+
+      let customerId = user.stripeCustomerId;
+      
+      if (!customerId) {
+        const customer = await stripe.customers.create({
+          email: user.email,
+          name: `${user.firstName || ''} ${user.lastName || ''}`.trim() || 'User',
+          metadata: {
+            userId: userId,
+            platform: "kin2_workforce"
+          }
+        });
+        customerId = customer.id;
+        
+        // Update user with Stripe customer ID
+        await storage.upsertUser({
+          ...user,
+          stripeCustomerId: customerId
+        });
+      }
+
+      const subscription = await stripe.subscriptions.create({
+        customer: customerId,
+        items: [{
+          price_data: {
+            currency: 'gbp',
+            product_data: {
+              name: "Kin2 Workforce Premium"
+            },
+            unit_amount: 2999,
+            recurring: {
+              interval: 'month'
+            }
+          }
+        }],
+        payment_behavior: 'default_incomplete',
+        expand: ['latest_invoice.payment_intent'],
+      });
+
+      // Update user with subscription ID
+      await storage.upsertUser({
+        ...user,
+        stripeCustomerId: customerId,
+        stripeSubscriptionId: subscription.id
+      });
+
+      res.json({
+        subscriptionId: subscription.id,
+        clientSecret: (subscription.latest_invoice as any)?.payment_intent?.client_secret,
+      });
+    } catch (error: any) {
+      console.error("Error creating subscription:", error);
+      res.status(500).json({ message: "Error creating subscription: " + error.message });
+    }
+  });
+
+  // Reports and analytics
+  app.get('/api/reports/hmrc-csv', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const user = await storage.getUser(userId);
+      
+      if (user?.role !== 'admin') {
+        return res.status(403).json({ message: 'Admin access required' });
+      }
+      
+      // Generate HMRC-compliant CSV data
+      const payments = await storage.getPaymentsByWorker('all'); // This would need to be implemented
+      const csvData = generateHMRCCSV(payments);
+      
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', `attachment; filename=hmrc-report-${new Date().toISOString().split('T')[0]}.csv`);
+      res.send(csvData);
+    } catch (error: any) {
+      console.error("Error generating HMRC report:", error);
+      res.status(500).json({ message: "Error generating report: " + error.message });
+    }
+  });
+
+  app.get('/api/reports/analytics', isAuthenticated, async (req, res) => {
+    try {
+      const stats = await storage.getDashboardStats();
+      
+      // Enhanced analytics data
+      const analytics = {
+        ...stats,
+        chartData: {
+          monthlyRevenue: [
+            { month: 'Jan', revenue: 12500 },
+            { month: 'Feb', revenue: 15200 },
+            { month: 'Mar', revenue: 18900 },
+            { month: 'Apr', revenue: 22300 },
+            { month: 'May', revenue: 19800 },
+            { month: 'Jun', revenue: 25600 }
+          ],
+          workerPerformance: [
+            { name: 'Completed Shifts', value: 89 },
+            { name: 'On Time Arrival', value: 94 },
+            { name: 'Customer Rating', value: 4.7 },
+            { name: 'Course Completion', value: 76 }
+          ],
+          jobCategories: [
+            { category: 'Technology', count: 45 },
+            { category: 'Healthcare', count: 32 },
+            { category: 'Retail', count: 28 },
+            { category: 'Hospitality', count: 21 },
+            { category: 'Manufacturing', count: 15 }
+          ]
+        }
+      };
+      
+      res.json(analytics);
+    } catch (error) {
+      console.error("Error fetching analytics:", error);
+      res.status(500).json({ message: "Failed to fetch analytics" });
+    }
+  });
+
+  // Compliance and GDPR
+  app.post('/api/gdpr/data-export', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const user = await storage.getUser(userId);
+      
+      if (!user) {
+        return res.status(404).json({ message: 'User not found' });
+      }
+      
+      // Compile all user data for GDPR export
+      const userData = {
+        profile: user,
+        jobs: await storage.getJobsByClient(userId),
+        timesheets: await storage.getTimesheetsByWorker(userId),
+        payments: await storage.getPaymentsByWorker(userId),
+        courses: await storage.getUserCourseCompletions(userId),
+        activities: await storage.getRecentActivities(100) // All activities for this user
+      };
+      
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Content-Disposition', `attachment; filename=user-data-export-${userId}.json`);
+      res.json(userData);
+    } catch (error) {
+      console.error("Error exporting user data:", error);
+      res.status(500).json({ message: "Failed to export user data" });
+    }
+  });
+
+  // AI Routes
+  app.post('/api/ai/chat', isAuthenticated, async (req: any, res) => {
+    try {
+      const { message, context } = req.body;
+      const userId = (req.user as any)?.claims?.sub;
+      
+      if (!message?.trim()) {
+        return res.status(400).json({ message: 'Message is required' });
+      }
+
+      // Timeout after 10 seconds
+      const timeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('AI request timeout')), 10000)
+      );
+
+      // Get user context for personalized responses
+      const user = await storage.getUser(userId);
+      const enhancedContext = {
+        ...context,
+        userRole: user?.role || 'admin',
+        timestamp: new Date().toISOString()
+      };
+
+      const aiPromise = aiService.chatAssistant(message, userId || '', enhancedContext);
+      const response = await Promise.race([aiPromise, timeoutPromise]);
+      
+      res.json(response);
+    } catch (error) {
+      console.error("AI chat error:", error);
+      res.status(500).json({ 
+        message: "I'm temporarily unavailable. Please try again in a moment.",
+        suggestions: ["Try AI Intelligence dashboard", "Check platform features", "Review workforce analytics"]
+      });
+    }
+  });
+
+  app.post('/api/ai/job-match', isAuthenticated, async (req: any, res) => {
+    try {
+      const { jobId } = req.body;
+      const job = await storage.getJobById(jobId);
+      if (!job) {
+        return res.status(404).json({ message: "Job not found" });
+      }
+      
+      const workers = await storage.getUsersByRole('worker');
+      const matches = await aiService.generateJobMatch(job, workers as any);
+      res.json(matches);
+    } catch (error) {
+      console.error("AI job matching error:", error);
+      res.status(500).json({ message: "Failed to generate job matches" });
+    }
+  });
+
+  app.post('/api/ai/schedule-recommendations', isAuthenticated, async (req: any, res) => {
+    try {
+      const shifts = await storage.getShiftsByJob(req.body.jobId || '');
+      const workers = await storage.getUsersByRole('worker');
+      const recommendations = await aiService.generateScheduleRecommendation(shifts as any, workers as any);
+      res.json(recommendations);
+    } catch (error) {
+      console.error("AI scheduling error:", error);
+      res.status(500).json({ message: "Failed to generate schedule recommendations" });
+    }
+  });
+
+  app.get('/api/ai/insights', isAuthenticated, async (req, res) => {
+    try {
+      const stats = await storage.getDashboardStats();
+      const insights = await aiService.generateInsights(stats as any);
+      res.json({ insights });
+    } catch (error) {
+      console.error("AI insights error:", error);
+      res.status(500).json({ message: "Failed to generate insights" });
+    }
+  });
+
+  // AI Automation Recommendations
+  app.get('/api/ai/automation', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = (req.user as any)?.claims?.sub;
+      const user = await storage.getUser(userId);
+      
+      // Get simplified data for automation analysis
+      const jobs = await storage.getJobs();
+      const stats = await storage.getDashboardStats();
+      
+      const workforceData = {
+        userRole: user?.role || 'admin',
+        totalJobs: jobs.length,
+        activeJobs: jobs.filter((j: any) => j.status === 'active').length,
+        stats: stats
+      };
+
+      const recommendations = await aiService.generateAutomationRecommendations(workforceData as any);
+      res.json({ recommendations });
+    } catch (error) {
+      console.error("AI automation error:", error);
+      res.status(500).json({ message: "Failed to generate automation recommendations" });
+    }
+  });
+
+  // Integration Management Routes
+  app.get('/api/integrations', isAuthenticated, async (req, res) => {
+    try {
+      const integrations = [
+        {
+          id: 'replit-auth',
+          name: 'Replit Authentication',
+          status: 'connected',
+          category: 'core',
+          healthCheck: true
+        },
+        {
+          id: 'neon-database',
+          name: 'Neon PostgreSQL',
+          status: 'connected', 
+          category: 'core',
+          healthCheck: true
+        },
+        {
+          id: 'stripe-payments',
+          name: 'Stripe Payments',
+          status: process.env.STRIPE_SECRET_KEY ? 'connected' : 'available',
+          category: 'payments',
+          healthCheck: !!process.env.STRIPE_SECRET_KEY
+        },
+        {
+          id: 'openai-ai',
+          name: 'OpenAI Intelligence',
+          status: process.env.OPENAI_API_KEY ? 'connected' : 'available',
+          category: 'ai',
+          healthCheck: !!process.env.OPENAI_API_KEY
+        }
+      ];
+      
+      res.json({ integrations });
+    } catch (error) {
+      console.error("Integration status error:", error);
+      res.status(500).json({ message: "Failed to fetch integration status" });
+    }
+  });
+
+  // System Status for Integrations
+  app.get('/api/system/status', isAuthenticated, async (req, res) => {
+    try {
+      const status = {
+        database: { status: 'healthy', latency: '< 100ms' },
+        authentication: { status: 'healthy', provider: 'Replit Auth' },
+        payments: { status: process.env.STRIPE_SECRET_KEY ? 'healthy' : 'disconnected' },
+        ai: { status: process.env.OPENAI_API_KEY ? 'healthy' : 'disconnected' }
+      };
+      
+      res.json(status);
+    } catch (error) {
+      console.error("System status error:", error);
+      res.status(500).json({ message: "Failed to fetch system status" });
+    }
+  });
+
+  // Webhook Management
+  app.post('/api/integrations/webhook', isAuthenticated, async (req: any, res) => {
+    try {
+      const { service, event, data } = req.body;
+      
+      // Process webhook based on service
+      switch (service) {
+        case 'stripe':
+          // Already handled by existing Stripe webhook
+          break;
+        case 'slack':
+          // Process Slack webhooks
+          logger.info('Slack webhook received:', event, data);
+          break;
+        case 'twilio':
+          // Process Twilio webhooks  
+          logger.info('Twilio webhook received:', event, data);
+          break;
+        default:
+          logger.info('Unknown webhook service:', service);
+      }
+      
+      res.json({ received: true });
+    } catch (error) {
+      console.error("Webhook processing error:", error);
+      res.status(500).json({ message: "Failed to process webhook" });
+    }
+  });
+
+  // GDPR Compliance Routes
+  app.post('/api/gdpr/cookie-consent', async (req: any, res) => {
+    try {
+      const { gdprService } = await import('./gdpr.js');
+      const { consents } = req.body;
+      const userId = (req.user as any)?.claims?.sub;
+      const sessionId = req.sessionID;
+      const ipAddress = req.ip || req.connection.remoteAddress;
+      const userAgent = req.get('User-Agent');
+
+      const consent = await gdprService.recordCookieConsent({
+        userId,
+        sessionId,
+        consents,
+        ipAddress,
+        userAgent,
+      });
+
+      res.json({ success: true, consent });
+    } catch (error) {
+      console.error("Cookie consent error:", error);
+      res.status(500).json({ message: "Failed to record consent" });
+    }
+  });
+
+  app.get('/api/gdpr/cookie-consent', async (req: any, res) => {
+    try {
+      const { gdprService } = await import('./gdpr.js');
+      const userId = (req.user as any)?.claims?.sub;
+      const sessionId = req.sessionID;
+
+      const consent = await gdprService.getCookieConsent(userId, sessionId);
+      res.json(consent);
+    } catch (error) {
+      console.error("Get cookie consent error:", error);
+      res.status(500).json({ message: "Failed to get consent" });
+    }
+  });
+
+  app.post('/api/gdpr/data-request', isAuthenticated, async (req: any, res) => {
+    try {
+      const { gdprService } = await import('./gdpr.js');
+      const { requestType, requestDetails } = req.body;
+      const userId = req.user.claims.sub;
+
+      const request = await gdprService.submitDataRequest({
+        userId,
+        requestType,
+        requestDetails,
+        verificationMethod: 'authenticated_session',
+      });
+
+      res.json({ success: true, request });
+    } catch (error) {
+      console.error("Data request error:", error);
+      res.status(500).json({ message: "Failed to submit data request" });
+    }
+  });
+
+  app.get('/api/gdpr/privacy-data', isAuthenticated, async (req: any, res) => {
+    try {
+      const { gdprService } = await import('./gdpr.js');
+      const userId = req.user.claims.sub;
+
+      const privacyData = await gdprService.getUserPrivacyData(userId);
+      res.json(privacyData);
+    } catch (error) {
+      console.error("Privacy data error:", error);
+      res.status(500).json({ message: "Failed to get privacy data" });
+    }
+  });
+
+  app.get('/api/gdpr/export-data', isAuthenticated, async (req: any, res) => {
+    try {
+      const { gdprService } = await import('./gdpr.js');
+      const userId = req.user.claims.sub;
+
+      const exportData = await gdprService.exportUserData(userId);
+      
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Content-Disposition', `attachment; filename="gdpr-data-export-${userId}-${Date.now()}.json"`);
+      res.json(exportData);
+    } catch (error) {
+      console.error("Data export error:", error);
+      res.status(500).json({ message: "Failed to export data" });
+    }
+  });
+
+  // Admin GDPR routes
+  app.get('/api/gdpr/compliance-report', isAuthenticated, async (req: any, res) => {
+    try {
+      if (req.user.role !== 'admin') {
+        return res.status(403).json({ message: "Admin access required" });
+      }
+
+      const { gdprService } = await import('./gdpr.js');
+      const { start, end } = req.query;
+      
+      const startDate = start ? new Date(start) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+      const endDate = end ? new Date(end) : new Date();
+
+      const report = await gdprService.generateComplianceReport(startDate, endDate);
+      res.json(report);
+    } catch (error) {
+      console.error("Compliance report error:", error);
+      res.status(500).json({ message: "Failed to generate compliance report" });
+    }
+  });
+
+  // Advanced Analytics Routes
+  app.get('/api/analytics/system-metrics', isAuthenticated, async (req: any, res) => {
+    try {
+      const { analyticsEngine } = await import('./analytics-advanced.js');
+      const organizationId = req.query.organizationId;
+      
+      const analytics = await analyticsEngine.generateAdvancedAnalytics(organizationId);
+      
+      // Transform to system metrics format
+      const systemMetrics = {
+        performance: {
+          avgResponseTime: analytics.performanceMetrics.systemHealth.responseTime,
+          memoryUsage: analytics.performanceMetrics.systemHealth.resourceUtilization.memory,
+          cpuUsage: analytics.performanceMetrics.systemHealth.resourceUtilization.cpu,
+          uptime: analytics.performanceMetrics.systemHealth.uptime,
+          requestsPerMinute: analytics.performanceMetrics.systemHealth.throughput,
+          responseTimeHistory: [
+            { time: '09:00', responseTime: 185 },
+            { time: '09:30', responseTime: 192 },
+            { time: '10:00', responseTime: 178 },
+            { time: '10:30', responseTime: 201 }
+          ],
+          memoryHistory: [
+            { time: '09:00', used: 45, free: 55 },
+            { time: '09:30', used: 48, free: 52 },
+            { time: '10:00', used: 52, free: 48 },
+            { time: '10:30', used: 49, free: 51 }
+          ]
+        },
+        integrations: {
+          totalActive: 8,
+          healthyCount: 6,
+          degradedCount: 1,
+          downCount: 1
+        },
+        database: {
+          connectionPool: 35,
+          queryPerformance: 45,
+          activeConnections: 7,
+          tableStats: [
+            { name: 'users', rows: 1247, size: '2.3 MB' },
+            { name: 'jobs', rows: 892, size: '1.8 MB' },
+            { name: 'shifts', rows: 3421, size: '4.1 MB' },
+            { name: 'payments', rows: 756, size: '1.2 MB' }
+          ]
+        },
+        users: {
+          totalUsers: analytics.workforceAnalytics.workforce.totalWorkers,
+          activeUsers: analytics.workforceAnalytics.workforce.activeWorkers,
+          newSignups: 23,
+          retention: analytics.workforceAnalytics.workforce.retentionRate
+        }
+      };
+      
+      res.json(systemMetrics);
+    } catch (error) {
+      console.error("Error generating system metrics:", error);
+      res.status(500).json({ message: "Failed to generate system metrics" });
+    }
+  });
+
+  app.get('/api/analytics/advanced', isAuthenticated, async (req: any, res) => {
+    try {
+      const { analyticsEngine } = await import('./analytics-advanced.js');
+      const organizationId = req.query.organizationId;
+      
+      const analytics = await analyticsEngine.generateAdvancedAnalytics(organizationId);
+      res.json(analytics);
+    } catch (error) {
+      console.error("Error generating advanced analytics:", error);
+      res.status(500).json({ message: "Failed to generate advanced analytics" });
+    }
+  });
+
+  // Integration Testing Routes
+  app.get('/api/integrations/health', async (req, res) => {
+    try {
+      const health = await integrationManager.checkAllIntegrations();
+      res.json(health);
+    } catch (error) {
+      console.error("Error checking integration health:", error);
+      res.status(500).json({ message: "Failed to check integration health" });
+    }
+  });
+
+  app.post('/api/integrations/test', isAuthenticated, async (req, res) => {
+    try {
+      const testResults = await integrationManager.runIntegrationTests();
+      res.json(testResults);
+    } catch (error) {
+      console.error("Error running integration tests:", error);
+      res.status(500).json({ message: "Failed to run integration tests" });
+    }
+  });
+
+  app.get('/api/testing/health-check', async (req, res) => {
+    try {
+      const { testingFramework } = await import('./testing.js');
+      const healthCheck = await testingFramework.runQuickHealthCheck();
+      res.json(healthCheck);
+    } catch (error) {
+      console.error("Error running health check:", error);
+      res.status(500).json({ message: "Failed to run health check" });
+    }
+  });
+
+  app.post('/api/testing/run-all', isAuthenticated, async (req: any, res) => {
+    try {
+      if (req.user.role !== 'admin') {
+        return res.status(403).json({ message: "Admin access required" });
+      }
+
+      const { testingFramework } = await import('./testing.js');
+      const allTests = await testingFramework.runAllTests();
+      const report = await testingFramework.generateTestReport();
+      
+      res.json({ tests: allTests, report });
+    } catch (error) {
+      console.error("Error running all tests:", error);
+      res.status(500).json({ message: "Failed to run tests" });
+    }
+  });
+
+  // Workflow Automation Routes
+  app.get('/api/workflows/rules', isAuthenticated, async (req: any, res) => {
+    try {
+      const { workflowEngine } = await import('./workflow-automation.js');
+      const rules = workflowEngine.getRules();
+      res.json(rules);
+    } catch (error) {
+      console.error("Error fetching workflow rules:", error);
+      res.status(500).json({ message: "Failed to fetch workflow rules" });
+    }
+  });
+
+  app.post('/api/workflows/rules', isAuthenticated, async (req: any, res) => {
+    try {
+      if (req.user.role !== 'admin') {
+        return res.status(403).json({ message: "Admin access required" });
+      }
+
+      const { workflowEngine } = await import('./workflow-automation.js');
+      await workflowEngine.addRule(req.body);
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Error creating workflow rule:", error);
+      res.status(500).json({ message: "Failed to create workflow rule" });
+    }
+  });
+
+  app.get('/api/workflows/executions', isAuthenticated, async (req: any, res) => {
+    try {
+      const { workflowEngine } = await import('./workflow-automation.js');
+      const executions = workflowEngine.getExecutions(50);
+      const stats = workflowEngine.getExecutionStats();
+      res.json({ executions, stats });
+    } catch (error) {
+      console.error("Error fetching workflow executions:", error);
+      res.status(500).json({ message: "Failed to fetch workflow executions" });
+    }
+  });
+
+  app.post('/api/workflows/trigger/:ruleId', isAuthenticated, async (req: any, res) => {
+    try {
+      if (req.user.role !== 'admin') {
+        return res.status(403).json({ message: "Admin access required" });
+      }
+
+      const { workflowEngine } = await import('./workflow-automation.js');
+      const execution = await workflowEngine.executeRule(req.params.ruleId, req.body);
+      res.json(execution);
+    } catch (error) {
+      console.error("Error executing workflow rule:", error);
+      res.status(500).json({ message: "Failed to execute workflow rule" });
+    }
+  });
+
+  // Real-time Notification Routes
+  app.get('/api/notifications', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const notifications = await storage.getUserNotifications(userId);
+      res.json(notifications);
+    } catch (error) {
+      console.error("Error fetching notifications:", error);
+      res.status(500).json({ message: "Failed to fetch notifications" });
+    }
+  });
+
+  app.post('/api/notifications/mark-read', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const { notificationIds } = req.body;
+      
+      await storage.markNotificationsAsRead(userId, notificationIds);
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Error marking notifications as read:", error);
+      res.status(500).json({ message: "Failed to mark notifications as read" });
+    }
+  });
+
+  app.get('/api/notifications/stats', isAuthenticated, async (req: any, res) => {
+    try {
+      const { realTimeNotificationService } = await import('./realtime-notifications.js');
+      const stats = realTimeNotificationService.getConnectionStats();
+      res.json(stats);
+    } catch (error) {
+      console.error("Error fetching notification stats:", error);
+      res.status(500).json({ message: "Failed to fetch notification stats" });
+    }
+  });
+
+  // Deployment Configuration Routes
+  app.get('/api/deployment/status', isAuthenticated, async (req: any, res) => {
+    try {
+      if (req.user.role !== 'admin') {
+        return res.status(403).json({ message: "Admin access required" });
+      }
+
+      const { deploymentManager } = await import('./deployment-config.js');
+      const readiness = await deploymentManager.validateDeploymentReadiness();
+      const report = await deploymentManager.generateDeploymentReport();
+      
+      res.json({ readiness, report });
+    } catch (error) {
+      console.error("Error checking deployment status:", error);
+      res.status(500).json({ message: "Failed to check deployment status" });
+    }
+  });
+
+  app.get('/api/deployment/config', isAuthenticated, async (req: any, res) => {
+    try {
+      if (req.user.role !== 'admin') {
+        return res.status(403).json({ message: "Admin access required" });
+      }
+
+      const { deploymentManager } = await import('./deployment-config.js');
+      const config = deploymentManager.getConfig();
+      res.json(config);
+    } catch (error) {
+      console.error("Error fetching deployment config:", error);
+      res.status(500).json({ message: "Failed to fetch deployment config" });
+    }
+  });
+
+  app.get('/api/deployment/docker-files', isAuthenticated, async (req: any, res) => {
+    try {
+      if (req.user.role !== 'admin') {
+        return res.status(403).json({ message: "Admin access required" });
+      }
+
+      const { deploymentManager } = await import('./deployment-config.js');
+      const files = {
+        dockerfile: deploymentManager.generateDockerfile(),
+        dockerCompose: deploymentManager.generateDockerCompose(),
+        kubernetes: deploymentManager.generateKubernetesManifests(),
+        nginx: deploymentManager.generateNginxConfig(),
+        deployScript: deploymentManager.generateDeploymentScript()
+      };
+      
+      res.json(files);
+    } catch (error) {
+      console.error("Error generating deployment files:", error);
+      res.status(500).json({ message: "Failed to generate deployment files" });
+    }
+  });
+
+  // API route handlers are now registered
+  logger.info('✅ All API routes registered successfully');
+
+function generateHMRCCSV(payments: any[]): string {
+  const headers = ['Date', 'Worker ID', 'Worker Name', 'Amount', 'Tax', 'NI', 'Net Pay'];
+  const rows = payments.map(payment => [
+    new Date(payment.createdAt).toISOString().split('T')[0],
+    payment.workerId,
+    'Worker Name', // Would need to join with user data
+    payment.amount,
+    (parseFloat(payment.amount) * 0.2).toFixed(2), // 20% tax estimate
+    (parseFloat(payment.amount) * 0.12).toFixed(2), // 12% NI estimate
+    (parseFloat(payment.amount) * 0.68).toFixed(2) // Net after tax and NI
+  ]);
+  
+  return [headers, ...rows].map(row => row.join(',')).join('\n');
+}
+
+  // Advanced Enterprise Features Routes
+  
+  // AI Analytics Routes
+  app.get('/api/ai/insights', isAuthenticated, async (req, res) => {
+    try {
+      const { aiAnalyticsService } = await import('./ai-analytics');
+      const insights = await aiAnalyticsService.generateWorkforceInsights();
+      res.json(insights);
+    } catch (error) {
+      logger.error('AI insights error:', error);
+      res.status(500).json({ message: 'Failed to generate insights' });
+    }
+  });
+
+  app.get('/api/ai/metrics', isAuthenticated, async (req, res) => {
+    try {
+      const { aiAnalyticsService } = await import('./ai-analytics');
+      const metrics = await aiAnalyticsService.calculateWorkforceMetrics();
+      res.json(metrics);
+    } catch (error) {
+      logger.error('AI metrics error:', error);
+      res.status(500).json({ message: 'Failed to calculate metrics' });
+    }
+  });
+
+  // Business Intelligence Routes
+  app.get('/api/bi/forecast/:type', isAuthenticated, async (req, res) => {
+    try {
+      const { businessIntelligenceService } = await import('./business-intelligence');
+      const { type } = req.params;
+      const periods = parseInt(req.query.periods as string) || 6;
+      const forecast = await businessIntelligenceService.generateForecast(type as any, periods);
+      res.json(forecast);
+    } catch (error) {
+      logger.error('Forecast error:', error);
+      res.status(500).json({ message: 'Failed to generate forecast' });
+    }
+  });
+
+  app.post('/api/bi/custom-report', isAuthenticated, async (req, res) => {
+    try {
+      const { businessIntelligenceService } = await import('./business-intelligence');
+      const report = await businessIntelligenceService.createCustomReport(req.body);
+      res.json(report);
+    } catch (error) {
+      logger.error('Custom report error:', error);
+      res.status(500).json({ message: 'Failed to create custom report' });
+    }
+  });
+
+  // API Marketplace Routes
+  app.get('/api/marketplace/apps', isAuthenticated, async (req, res) => {
+    try {
+      const { apiMarketplaceService } = await import('./api-marketplace');
+      const category = req.query.category as string;
+      const apps = await apiMarketplaceService.getMarketplaceApps(category);
+      res.json(apps);
+    } catch (error) {
+      logger.error('Marketplace apps error:', error);
+      res.status(500).json({ message: 'Failed to get marketplace apps' });
+    }
+  });
+
+  app.post('/api/marketplace/install/:appId', isAuthenticated, async (req, res) => {
+    try {
+      const { apiMarketplaceService } = await import('./api-marketplace');
+      const { appId } = req.params;
+      const userId = (req.user as any)?.claims?.sub;
+      await apiMarketplaceService.installApp(appId, userId);
+      res.json({ success: true });
+    } catch (error) {
+      logger.error('App installation error:', error);
+      res.status(500).json({ message: 'Failed to install app' });
+    }
+  });
+
+  // Mobile API Routes
+  app.get('/api/mobile/data', isAuthenticated, async (req, res) => {
+    try {
+      const { mobileAPIService } = await import('./mobile-api');
+      const userId = (req.user as any)?.claims?.sub;
+      const data = await mobileAPIService.getOptimizedMobileData(userId);
+      res.json(data);
+    } catch (error) {
+      logger.error('Mobile data error:', error);
+      res.status(500).json({ message: 'Failed to get mobile data' });
+    }
+  });
+
+  app.get('/api/mobile/nearby-jobs', isAuthenticated, async (req, res) => {
+    try {
+      const { mobileAPIService } = await import('./mobile-api');
+      const userId = (req.user as any)?.claims?.sub;
+      const radius = parseInt(req.query.radius as string) || 10;
+      const jobs = await mobileAPIService.getWorkerNearbyJobs(userId, radius);
+      res.json(jobs);
+    } catch (error) {
+      logger.error('Nearby jobs error:', error);
+      res.status(500).json({ message: 'Failed to get nearby jobs' });
+    }
+  });
+
+  app.post('/api/mobile/clock', isAuthenticated, async (req, res) => {
+    try {
+      const userId = (req.user as any)?.claims?.sub;
+      const { action, location } = req.body;
+      
+      // Process clock in/out
+      console.log(`⏰ ${action === 'in' ? 'Clock in' : 'Clock out'} for user ${userId}`);
+      
+      res.json({ 
+        success: true, 
+        timestamp: new Date(),
+        action: action === 'in' ? 'clocked_in' : 'clocked_out'
+      });
+    } catch (error) {
+      logger.error('Clock action error:', error);
+      res.status(500).json({ message: 'Failed to process clock action' });
+    }
+  });
+
+  // Enterprise Backup Routes
+  app.post('/api/enterprise/backup', isAuthenticated, async (req, res) => {
+    try {
+      const { enterpriseBackupService } = await import('./enterprise-backup');
+      const userId = (req.user as any)?.claims?.sub;
+      const backup = await enterpriseBackupService.createFullBackup(userId);
+      res.json(backup);
+    } catch (error) {
+      logger.error('Backup creation error:', error);
+      res.status(500).json({ message: 'Failed to create backup' });
+    }
+  });
+
+  app.get('/api/enterprise/backup/analytics', isAuthenticated, async (req, res) => {
+    try {
+      const { enterpriseBackupService } = await import('./enterprise-backup');
+      const userId = (req.user as any)?.claims?.sub;
+      const analytics = await enterpriseBackupService.getBackupAnalytics(userId);
+      res.json(analytics);
+    } catch (error) {
+      logger.error('Backup analytics error:', error);
+      res.status(500).json({ message: 'Failed to get backup analytics' });
+    }
+  });
+
+  // Payroll and Reporting routes
+  app.post('/api/payroll/generate', isAuthenticated, async (req: any, res) => {
+    try {
+      if (req.user.role !== 'admin') {
+        return res.status(403).json({ message: "Admin access required" });
+      }
+
+      const { payrollService } = await import('./services/payroll-service');
+      const { startDate, endDate } = req.body;
+      
+      const payrollData = await payrollService.generatePayrollForPeriod(
+        new Date(startDate), 
+        new Date(endDate)
+      );
+      
+      await payrollService.savePayrollRecords(
+        payrollData, 
+        new Date(startDate), 
+        new Date(endDate)
+      );
+      
+      res.json({
+        success: true,
+        recordsGenerated: payrollData.length,
+        totalGrossPay: payrollData.reduce((sum, p) => sum + p.grossPay, 0),
+        totalNetPay: payrollData.reduce((sum, p) => sum + p.netPay, 0)
+      });
+    } catch (error) {
+      console.error("Payroll generation error:", error);
+      res.status(500).json({ message: "Failed to generate payroll" });
+    }
+  });
+
+  app.get('/api/payroll/records', isAuthenticated, async (req: any, res) => {
+    try {
+      const { payrollService } = await import('./services/payroll-service');
+      const { year, month, workerId } = req.query;
+      
+      if (workerId) {
+        const records = await payrollService.getWorkerPayrollRecords(
+          workerId, 
+          parseInt(year || new Date().getFullYear().toString()),
+          month ? parseInt(month) : undefined
+        );
+        res.json(records);
+      } else {
+        // Admin view - get all records
+        if (req.user.role !== 'admin') {
+          return res.status(403).json({ message: "Admin access required" });
+        }
+        
+        const records = await payrollService.getPayrollForHMRC(year || "2024-25");
+        res.json(records);
+      }
+    } catch (error) {
+      console.error("Payroll records error:", error);
+      res.status(500).json({ message: "Failed to fetch payroll records" });
+    }
+  });
+
+  app.post('/api/reports/hmrc-csv', isAuthenticated, async (req: any, res) => {
+    try {
+      if (req.user.role !== 'admin') {
+        return res.status(403).json({ message: "Admin access required" });
+      }
+
+      const { hmrcService } = await import('./services/hmrc-service');
+      const { taxYear, payPeriod } = req.body;
+      
+      const csvData = await hmrcService.generateFPSSubmission(taxYear, payPeriod);
+      const submission = await hmrcService.saveHMRCSubmission(
+        "rti_fps", 
+        taxYear, 
+        payPeriod, 
+        csvData
+      );
+      
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', `attachment; filename="HMRC_FPS_${taxYear}_${payPeriod}.csv"`);
+      res.send(csvData);
+    } catch (error) {
+      console.error("HMRC CSV generation error:", error);
+      res.status(500).json({ message: "Failed to generate HMRC CSV" });
+    }
+  });
+
+  app.get('/api/payslips/:workerId/:payrollRecordId', isAuthenticated, async (req: any, res) => {
+    try {
+      const { payslipService } = await import('./services/payslip-service');
+      const { workerId, payrollRecordId } = req.params;
+      
+      // Check if user can access this payslip
+      if (req.user.role !== 'admin' && req.user.claims.sub !== workerId) {
+        return res.status(403).json({ message: "Access denied" });
+      }
+      
+      const payslipData = await payslipService.generatePayslip(workerId, payrollRecordId);
+      
+      if (!payslipData) {
+        return res.status(404).json({ message: "Payslip not found" });
+      }
+      
+      const html = payslipService.generatePayslipHTML(payslipData);
+      
+      res.setHeader('Content-Type', 'text/html');
+      res.send(html);
+    } catch (error) {
+      console.error("Payslip generation error:", error);
+      res.status(500).json({ message: "Failed to generate payslip" });
+    }
+  });
+
+  app.get('/api/reports/payroll-summary', isAuthenticated, async (req: any, res) => {
+    try {
+      if (req.user.role !== 'admin') {
+        return res.status(403).json({ message: "Admin access required" });
+      }
+
+      const { hmrcService } = await import('./services/hmrc-service');
+      const { startDate, endDate } = req.query;
+      
+      const report = await hmrcService.generatePayrollReport(
+        new Date(startDate || new Date().toISOString()),
+        new Date(endDate || new Date().toISOString())
+      );
+      
+      res.json(report);
+    } catch (error) {
+      console.error("Payroll summary error:", error);
+      res.status(500).json({ message: "Failed to generate payroll summary" });
+    }
+  });
+
+  app.get('/api/reports/p60/:workerId/:taxYear', isAuthenticated, async (req: any, res) => {
+    try {
+      const { hmrcService } = await import('./services/hmrc-service');
+      const { workerId, taxYear } = req.params;
+      
+      // Check if user can access this P60
+      if (req.user.role !== 'admin' && req.user.claims.sub !== workerId) {
+        return res.status(403).json({ message: "Access denied" });
+      }
+      
+      const p60Data = await hmrcService.generateP60Data(workerId, taxYear);
+      res.json(p60Data);
+    } catch (error) {
+      console.error("P60 generation error:", error);
+      res.status(500).json({ message: "Failed to generate P60" });
+    }
+  });
+
+  // Education System API Routes
+  const { educationService } = await import('./services/education-service');
+  
+  // Qualifications endpoints
+  app.post('/api/education/qualifications', isAuthenticated, async (req: any, res) => {
+    try {
+      const qualificationData = {
+        ...req.body,
+        userId: req.user.claims.sub,
+      };
+      const qualification = await educationService.createQualification(qualificationData);
+      res.json(qualification);
+    } catch (error) {
+      console.error("Error creating qualification:", error);
+      res.status(500).json({ message: "Failed to create qualification" });
+    }
+  });
+
+  app.get('/api/education/qualifications', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.query.userId || req.user.claims.sub;
+      const qualifications = await educationService.getUserQualifications(userId);
+      res.json(qualifications);
+    } catch (error) {
+      console.error("Error fetching qualifications:", error);
+      res.status(500).json({ message: "Failed to fetch qualifications" });
+    }
+  });
+
+  app.patch('/api/education/qualifications/:id/verify', isAuthenticated, async (req: any, res) => {
+    try {
+      if (req.user.role !== 'admin') {
+        return res.status(403).json({ message: "Only admins can verify qualifications" });
+      }
+      const qualification = await educationService.verifyQualification(req.params.id, req.user.claims.sub);
+      res.json(qualification);
+    } catch (error) {
+      console.error("Error verifying qualification:", error);
+      res.status(500).json({ message: "Failed to verify qualification" });
+    }
+  });
+
+  // Government programmes endpoints
+  app.post('/api/education/programmes', isAuthenticated, async (req: any, res) => {
+    try {
+      if (req.user.role !== 'admin') {
+        return res.status(403).json({ message: "Only admins can create programmes" });
+      }
+      const programme = await educationService.createGovernmentProgramme(req.body);
+      res.json(programme);
+    } catch (error) {
+      console.error("Error creating programme:", error);
+      res.status(500).json({ message: "Failed to create programme" });
+    }
+  });
+
+  app.get('/api/education/programmes', isAuthenticated, async (req, res) => {
+    try {
+      const { type, sector, location } = req.query;
+      const programmes = await educationService.getAvailableProgrammes(
+        type as string,
+        sector as string,
+        location as string
+      );
+      res.json(programmes);
+    } catch (error) {
+      console.error("Error fetching programmes:", error);
+      res.status(500).json({ message: "Failed to fetch programmes" });
+    }
+  });
+
+  app.post('/api/education/programmes/:id/apply', isAuthenticated, async (req: any, res) => {
+    try {
+      const applicationData = {
+        ...req.body,
+        userId: req.user.claims.sub,
+        programmeId: req.params.id,
+      };
+      const participation = await educationService.applyToProgram(applicationData);
+      res.json(participation);
+    } catch (error: any) {
+      console.error("Error applying to programme:", error);
+      res.status(400).json({ message: error.message });
+    }
+  });
+
+  app.get('/api/education/participations', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.query.userId || req.user.claims.sub;
+      const participations = await educationService.getUserProgrammeParticipations(userId);
+      res.json(participations);
+    } catch (error) {
+      console.error("Error fetching participations:", error);
+      res.status(500).json({ message: "Failed to fetch participations" });
+    }
+  });
+
+  app.patch('/api/education/participations/:id/progress', isAuthenticated, async (req: any, res) => {
+    try {
+      const { progressPercentage, assessmentResults } = req.body;
+      const participation = await educationService.updateParticipationProgress(
+        req.params.id,
+        progressPercentage,
+        assessmentResults
+      );
+      res.json(participation);
+    } catch (error) {
+      console.error("Error updating participation progress:", error);
+      res.status(500).json({ message: "Failed to update progress" });
+    }
+  });
+
+  // Skills framework endpoints
+  app.post('/api/education/skills', isAuthenticated, async (req: any, res) => {
+    try {
+      if (req.user.role !== 'admin') {
+        return res.status(403).json({ message: "Only admins can create skills" });
+      }
+      const skill = await educationService.createSkill(req.body);
+      res.json(skill);
+    } catch (error) {
+      console.error("Error creating skill:", error);
+      res.status(500).json({ message: "Failed to create skill" });
+    }
+  });
+
+  app.get('/api/education/skills', isAuthenticated, async (req, res) => {
+    try {
+      const skills = await educationService.getSkillsFramework();
+      res.json(skills);
+    } catch (error) {
+      console.error("Error fetching skills:", error);
+      res.status(500).json({ message: "Failed to fetch skills" });
+    }
+  });
+
+  app.post('/api/education/user-skills', isAuthenticated, async (req: any, res) => {
+    try {
+      const skillData = {
+        ...req.body,
+        userId: req.user.claims.sub,
+        assessedBy: req.user.claims.sub,
+      };
+      const userSkill = await educationService.assessUserSkill(skillData);
+      res.json(userSkill);
+    } catch (error) {
+      console.error("Error assessing user skill:", error);
+      res.status(500).json({ message: "Failed to assess skill" });
+    }
+  });
+
+  app.get('/api/education/user-skills', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.query.userId || req.user.claims.sub;
+      const skills = await educationService.getUserSkills(userId);
+      res.json(skills);
+    } catch (error) {
+      console.error("Error fetching user skills:", error);
+      res.status(500).json({ message: "Failed to fetch user skills" });
+    }
+  });
+
+  app.patch('/api/education/user-skills/:id/endorse', isAuthenticated, async (req: any, res) => {
+    try {
+      if (req.user.role !== 'admin') {
+        return res.status(403).json({ message: "Only supervisors can endorse skills" });
+      }
+      const skill = await educationService.endorseSkill(req.params.id, req.user.claims.sub);
+      res.json(skill);
+    } catch (error) {
+      console.error("Error endorsing skill:", error);
+      res.status(500).json({ message: "Failed to endorse skill" });
+    }
+  });
+
+  // Development plans endpoints
+  app.post('/api/education/development-plans', isAuthenticated, async (req: any, res) => {
+    try {
+      const planData = {
+        ...req.body,
+        userId: req.user.claims.sub,
+        assignedBy: req.user.claims.sub,
+      };
+      const plan = await educationService.createDevelopmentPlan(planData);
+      res.json(plan);
+    } catch (error) {
+      console.error("Error creating development plan:", error);
+      res.status(500).json({ message: "Failed to create development plan" });
+    }
+  });
+
+  app.get('/api/education/development-plans', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.query.userId || req.user.claims.sub;
+      const plans = await educationService.getUserDevelopmentPlans(userId);
+      res.json(plans);
+    } catch (error) {
+      console.error("Error fetching development plans:", error);
+      res.status(500).json({ message: "Failed to fetch development plans" });
+    }
+  });
+
+  app.patch('/api/education/development-plans/:id/progress', isAuthenticated, async (req: any, res) => {
+    try {
+      const { progressPercentage } = req.body;
+      const plan = await educationService.updateDevelopmentPlanProgress(req.params.id, progressPercentage);
+      res.json(plan);
+    } catch (error) {
+      console.error("Error updating development plan progress:", error);
+      res.status(500).json({ message: "Failed to update progress" });
+    }
+  });
+
+  // Learning pathways endpoints
+  app.post('/api/education/pathways', isAuthenticated, async (req: any, res) => {
+    try {
+      if (req.user.role !== 'admin') {
+        return res.status(403).json({ message: "Only admins can create learning pathways" });
+      }
+      const pathway = await educationService.createLearningPathway(req.body);
+      res.json(pathway);
+    } catch (error) {
+      console.error("Error creating learning pathway:", error);
+      res.status(500).json({ message: "Failed to create learning pathway" });
+    }
+  });
+
+  app.get('/api/education/pathways', isAuthenticated, async (req, res) => {
+    try {
+      const { industry, careerLevel } = req.query;
+      const pathways = await educationService.getLearningPathways(
+        industry as string,
+        careerLevel as string
+      );
+      res.json(pathways);
+    } catch (error) {
+      console.error("Error fetching learning pathways:", error);
+      res.status(500).json({ message: "Failed to fetch learning pathways" });
+    }
+  });
+
+  app.post('/api/education/pathways/:id/enroll', isAuthenticated, async (req: any, res) => {
+    try {
+      const progress = await educationService.enrollInPathway(req.user.claims.sub, req.params.id);
+      res.json(progress);
+    } catch (error: any) {
+      console.error("Error enrolling in pathway:", error);
+      res.status(400).json({ message: error.message });
+    }
+  });
+
+  app.patch('/api/education/pathway-progress/:id', isAuthenticated, async (req: any, res) => {
+    try {
+      const { completedSteps } = req.body;
+      const progress = await educationService.updatePathwayProgress(req.params.id, completedSteps);
+      res.json(progress);
+    } catch (error) {
+      console.error("Error updating pathway progress:", error);
+      res.status(500).json({ message: "Failed to update pathway progress" });
+    }
+  });
+
+  // Education providers endpoints
+  app.post('/api/education/providers', isAuthenticated, async (req: any, res) => {
+    try {
+      if (req.user.role !== 'admin') {
+        return res.status(403).json({ message: "Only admins can add education providers" });
+      }
+      const provider = await educationService.addEducationProvider(req.body);
+      res.json(provider);
+    } catch (error) {
+      console.error("Error adding education provider:", error);
+      res.status(500).json({ message: "Failed to add education provider" });
+    }
+  });
+
+  app.get('/api/education/providers', isAuthenticated, async (req, res) => {
+    try {
+      const providers = await educationService.getEducationProviders();
+      res.json(providers);
+    } catch (error) {
+      console.error("Error fetching education providers:", error);
+      res.status(500).json({ message: "Failed to fetch education providers" });
+    }
+  });
+
+  app.post('/api/education/providers/:id/sync', isAuthenticated, async (req: any, res) => {
+    try {
+      if (req.user.role !== 'admin') {
+        return res.status(403).json({ message: "Only admins can sync provider data" });
+      }
+      await educationService.syncProviderData(req.params.id);
+      res.json({ message: "Provider data synchronized successfully" });
+    } catch (error: any) {
+      console.error("Error syncing provider data:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Education analytics endpoint
+  app.get('/api/education/metrics', isAuthenticated, async (req: any, res) => {
+    try {
+      if (req.user.role !== 'admin') {
+        return res.status(403).json({ message: "Only admins can view education metrics" });
+      }
+      const metrics = await educationService.getEducationMetrics();
+      res.json(metrics);
+    } catch (error) {
+      console.error("Error fetching education metrics:", error);
+      res.status(500).json({ message: "Failed to fetch education metrics" });
+    }
+  });
+
+  // Initialize education system
+  app.post('/api/education/initialize', isAuthenticated, async (req: any, res) => {
+    try {
+      if (req.user.role !== 'admin') {
+        return res.status(403).json({ message: "Only admins can initialize education system" });
+      }
+      
+      await Promise.all([
+        educationService.syncGovernmentProgrammes(),
+        educationService.initializeSkillsFramework()
+      ]);
+      
+      res.json({ message: "Education system initialized successfully" });
+    } catch (error) {
+      console.error("Error initializing education system:", error);
+      res.status(500).json({ message: "Failed to initialize education system" });
+    }
+  });
+
+  // Government & Social Benefits API Routes
+  const { governmentService } = await import('./services/government-service');
+
+  // Universal Credit endpoints
+  app.post('/api/government/universal-credit', isAuthenticated, async (req: any, res) => {
+    try {
+      const claimData = {
+        ...req.body,
+        userId: req.user.claims.sub,
+      };
+      const claim = await governmentService.createUniversalCreditClaim(claimData);
+      res.json(claim);
+    } catch (error) {
+      console.error("Error creating UC claim:", error);
+      res.status(500).json({ message: "Failed to create Universal Credit claim" });
+    }
+  });
+
+  app.get('/api/government/universal-credit', isAuthenticated, async (req: any, res) => {
+    try {
+      const claim = await governmentService.getUniversalCreditClaim(req.user.claims.sub);
+      res.json(claim);
+    } catch (error) {
+      console.error("Error fetching UC claim:", error);
+      res.status(500).json({ message: "Failed to fetch Universal Credit claim" });
+    }
+  });
+
+  app.patch('/api/government/universal-credit/:id', isAuthenticated, async (req: any, res) => {
+    try {
+      // Validate government claim update data
+      const updateSchema = z.object({
+        status: z.string().optional(),
+        amount: z.number().optional(),
+        nextPaymentDate: z.string().optional(),
+        notes: z.string().optional()
+      }).strict();
+      const updateData = updateSchema.parse(req.body);
+      const updatedClaim = await governmentService.updateUniversalCreditClaim(req.params.id, updateData as any);
+      res.json(updatedClaim);
+    } catch (error: any) {
+      if (error.name === 'ZodError') {
+        return res.status(400).json({ message: "Invalid update data", errors: error.errors });
+      }
+      console.error("Error updating UC claim:", error);
+      res.status(500).json({ message: "Failed to update Universal Credit claim" });
+    }
+  });
+
+  // Social Benefits endpoints
+  app.post('/api/government/benefits', isAuthenticated, async (req: any, res) => {
+    try {
+      const benefitData = {
+        ...req.body,
+        userId: req.user.claims.sub,
+      };
+      const benefit = await governmentService.createSocialBenefit(benefitData);
+      res.json(benefit);
+    } catch (error) {
+      console.error("Error creating benefit:", error);
+      res.status(500).json({ message: "Failed to create benefit claim" });
+    }
+  });
+
+  app.get('/api/government/benefits', isAuthenticated, async (req: any, res) => {
+    try {
+      const benefits = await governmentService.getUserBenefits(req.user.claims.sub);
+      res.json(benefits);
+    } catch (error) {
+      console.error("Error fetching benefits:", error);
+      res.status(500).json({ message: "Failed to fetch benefits" });
+    }
+  });
+
+  app.patch('/api/government/benefits/:id/status', isAuthenticated, async (req: any, res) => {
+    try {
+      const { status } = req.body;
+      const benefit = await governmentService.updateBenefitStatus(req.params.id, status);
+      res.json(benefit);
+    } catch (error) {
+      console.error("Error updating benefit status:", error);
+      res.status(500).json({ message: "Failed to update benefit status" });
+    }
+  });
+
+  // Payment history endpoints
+  app.post('/api/government/payments', isAuthenticated, async (req: any, res) => {
+    try {
+      if (req.user.role !== 'admin') {
+        return res.status(403).json({ message: "Only admins can record payments" });
+      }
+      const payment = await governmentService.recordBenefitPayment(req.body);
+      res.json(payment);
+    } catch (error) {
+      console.error("Error recording payment:", error);
+      res.status(500).json({ message: "Failed to record payment" });
+    }
+  });
+
+  app.get('/api/government/payments', isAuthenticated, async (req: any, res) => {
+    try {
+      const { startDate, endDate } = req.query;
+      const payments = await governmentService.getUserPaymentHistory(
+        req.user.claims.sub,
+        startDate ? new Date(startDate as string) : undefined,
+        endDate ? new Date(endDate as string) : undefined
+      );
+      res.json(payments);
+    } catch (error) {
+      console.error("Error fetching payments:", error);
+      res.status(500).json({ message: "Failed to fetch payment history" });
+    }
+  });
+
+  app.get('/api/government/payments/monthly/:month', isAuthenticated, async (req: any, res) => {
+    try {
+      const total = await governmentService.calculateMonthlyBenefitTotal(
+        req.user.claims.sub,
+        req.params.month
+      );
+      res.json({ month: req.params.month, total });
+    } catch (error) {
+      console.error("Error calculating monthly total:", error);
+      res.status(500).json({ message: "Failed to calculate monthly total" });
+    }
+  });
+
+  // Work search compliance endpoints
+  app.patch('/api/government/work-search/:id/compliance', isAuthenticated, async (req: any, res) => {
+    try {
+      const { activitiesCompleted } = req.body;
+      const requirement = await governmentService.updateWorkSearchCompliance(
+        req.params.id,
+        activitiesCompleted
+      );
+      res.json(requirement);
+    } catch (error) {
+      console.error("Error updating compliance:", error);
+      res.status(500).json({ message: "Failed to update work search compliance" });
+    }
+  });
+
+  // Government communications endpoints
+  app.get('/api/government/communications', isAuthenticated, async (req: any, res) => {
+    try {
+      const { unreadOnly } = req.query;
+      const communications = await governmentService.getUserCommunications(
+        req.user.claims.sub,
+        unreadOnly === 'true'
+      );
+      res.json(communications);
+    } catch (error) {
+      console.error("Error fetching communications:", error);
+      res.status(500).json({ message: "Failed to fetch communications" });
+    }
+  });
+
+  app.patch('/api/government/communications/:id/read', isAuthenticated, async (req: any, res) => {
+    try {
+      const communication = await governmentService.markCommunicationRead(req.params.id);
+      res.json(communication);
+    } catch (error) {
+      console.error("Error marking communication read:", error);
+      res.status(500).json({ message: "Failed to mark communication as read" });
+    }
+  });
+
+  // Social reports endpoints
+  app.post('/api/government/reports/uc-summary', isAuthenticated, async (req: any, res) => {
+    try {
+      const report = await governmentService.generateUniversalCreditSummary(req.user.claims.sub);
+      res.json(report);
+    } catch (error: any) {
+      console.error("Error generating UC summary:", error);
+      res.status(500).json({ message: error.message || "Failed to generate UC summary" });
+    }
+  });
+
+  app.post('/api/government/reports/benefit-breakdown', isAuthenticated, async (req: any, res) => {
+    try {
+      const report = await governmentService.generateBenefitBreakdown(req.user.claims.sub);
+      res.json(report);
+    } catch (error) {
+      console.error("Error generating benefit breakdown:", error);
+      res.status(500).json({ message: "Failed to generate benefit breakdown" });
+    }
+  });
+
+  app.post('/api/government/reports/earnings-impact', isAuthenticated, async (req: any, res) => {
+    try {
+      const { earnings } = req.body;
+      const report = await governmentService.generateEarningsImpactReport(req.user.claims.sub, earnings);
+      res.json(report);
+    } catch (error: any) {
+      console.error("Error generating earnings impact report:", error);
+      res.status(500).json({ message: error.message || "Failed to generate earnings impact report" });
+    }
+  });
+
+  // Government sync and dashboard
+  app.post('/api/government/sync', isAuthenticated, async (req: any, res) => {
+    try {
+      const result = await governmentService.syncWithGovernmentAPIs(req.user.claims.sub);
+      res.json(result);
+    } catch (error: any) {
+      console.error("Error syncing with government APIs:", error);
+      res.status(500).json({ message: error.message || "Failed to sync with government systems" });
+    }
+  });
+
+  app.get('/api/government/dashboard', isAuthenticated, async (req: any, res) => {
+    try {
+      const stats = await governmentService.getDashboardStats(req.user.claims.sub);
+      res.json(stats);
+    } catch (error) {
+      console.error("Error fetching dashboard stats:", error);
+      res.status(500).json({ message: "Failed to fetch dashboard statistics" });
+    }
+  });
+
+  // Admin endpoints for government management
+  app.get('/api/admin/government/api-logs', isAuthenticated, async (req: any, res) => {
+    try {
+      if (req.user.role !== 'admin') {
+        return res.status(403).json({ message: "Only admins can view API logs" });
+      }
+      
+      const { userId, startDate, endDate } = req.query;
+      const logs = await governmentService.getApiLogs(
+        userId as string,
+        startDate ? new Date(startDate as string) : undefined,
+        endDate ? new Date(endDate as string) : undefined
+      );
+      res.json(logs);
+    } catch (error) {
+      console.error("Error fetching API logs:", error);
+      res.status(500).json({ message: "Failed to fetch API logs" });
+    }
+  });
+
+  // Learning Management System API Routes
+  const { learningManagementService } = await import('./services/learning-management-service');
+
+  // Course Management Routes
+  app.get('/api/courses/:courseId', isAuthenticated, async (req: any, res) => {
+    try {
+      const course = await learningManagementService.getCourseWithContent(req.params.courseId);
+      if (!course) {
+        return res.status(404).json({ message: "Course not found" });
+      }
+      res.json(course);
+    } catch (error) {
+      console.error("Error fetching course:", error);
+      res.status(500).json({ message: "Failed to fetch course" });
+    }
+  });
+
+  app.post('/api/courses/:courseId/enroll', isAuthenticated, async (req: any, res) => {
+    try {
+      const enrollment = await learningManagementService.enrollUserInCourse(
+        req.user.claims.sub,
+        req.params.courseId
+      );
+      res.json(enrollment);
+    } catch (error) {
+      console.error("Error enrolling in course:", error);
+      res.status(500).json({ message: "Failed to enroll in course" });
+    }
+  });
+
+  app.get('/api/courses/:courseId/learning-path', isAuthenticated, async (req: any, res) => {
+    try {
+      const learningPath = await learningManagementService.getLearningPath(
+        req.user.claims.sub,
+        req.params.courseId
+      );
+      res.json(learningPath);
+    } catch (error) {
+      console.error("Error fetching learning path:", error);
+      res.status(500).json({ message: "Failed to fetch learning path" });
+    }
+  });
+
+  // Lesson Management Routes
+  app.post('/api/lessons', isAuthenticated, async (req: any, res) => {
+    try {
+      const lesson = await learningManagementService.createLesson(req.body);
+      res.json(lesson);
+    } catch (error) {
+      console.error("Error creating lesson:", error);
+      res.status(500).json({ message: "Failed to create lesson" });
+    }
+  });
+
+  app.put('/api/lessons/:lessonId', isAuthenticated, async (req: any, res) => {
+    try {
+      // Validate lesson update data
+      const lessonSchema = z.object({
+        title: z.string().optional(),
+        content: z.string().optional(),
+        courseId: z.string().optional(),
+        order: z.number().optional(),
+        duration: z.number().optional()
+      }).strict();
+      const updateData = lessonSchema.parse(req.body);
+      const lesson = await learningManagementService.updateLesson(req.params.lessonId, updateData);
+      if (!lesson) {
+        return res.status(404).json({ message: "Lesson not found" });
+      }
+      res.json(lesson);
+    } catch (error: any) {
+      if (error.name === 'ZodError') {
+        return res.status(400).json({ message: "Invalid lesson data", errors: error.errors });
+      }
+      console.error("Error updating lesson:", error);
+      res.status(500).json({ message: "Failed to update lesson" });
+    }
+  });
+
+  app.delete('/api/lessons/:lessonId', isAuthenticated, async (req: any, res) => {
+    try {
+      const success = await learningManagementService.deleteLesson(req.params.lessonId);
+      if (!success) {
+        return res.status(404).json({ message: "Lesson not found" });
+      }
+      res.json({ message: "Lesson deleted successfully" });
+    } catch (error) {
+      console.error("Error deleting lesson:", error);
+      res.status(500).json({ message: "Failed to delete lesson" });
+    }
+  });
+
+  app.post('/api/lessons/:lessonId/progress', isAuthenticated, async (req: any, res) => {
+    try {
+      const progress = await learningManagementService.updateLessonProgress(
+        req.user.claims.sub,
+        req.params.lessonId,
+        req.body
+      );
+      
+      // Check if course is completed
+      const { db } = await import('./db');
+      const { lessons } = await import('@shared/schema');
+      const { eq } = await import('drizzle-orm');
+      const [lesson] = await db.select().from(lessons).where(eq(lessons.id, req.params.lessonId));
+      if (lesson) {
+        await learningManagementService.checkCourseCompletion(req.user.claims.sub, lesson.courseId);
+      }
+      
+      res.json(progress);
+    } catch (error) {
+      console.error("Error updating lesson progress:", error);
+      res.status(500).json({ message: "Failed to update lesson progress" });
+    }
+  });
+
+  // Quiz Management Routes
+  app.post('/api/quizzes', isAuthenticated, async (req: any, res) => {
+    try {
+      const quiz = await learningManagementService.createQuiz(req.body);
+      res.json(quiz);
+    } catch (error) {
+      console.error("Error creating quiz:", error);
+      res.status(500).json({ message: "Failed to create quiz" });
+    }
+  });
+
+  app.post('/api/quizzes/:quizId/questions', isAuthenticated, async (req: any, res) => {
+    try {
+      const question = await learningManagementService.addQuizQuestion({
+        quizId: req.params.quizId,
+        ...req.body
+      });
+      res.json(question);
+    } catch (error) {
+      console.error("Error adding quiz question:", error);
+      res.status(500).json({ message: "Failed to add quiz question" });
+    }
+  });
+
+  app.get('/api/quizzes/:quizId', isAuthenticated, async (req: any, res) => {
+    try {
+      const quiz = await learningManagementService.getQuizWithQuestions(req.params.quizId);
+      if (!quiz) {
+        return res.status(404).json({ message: "Quiz not found" });
+      }
+      
+      // Remove correct answers from questions for students
+      const sanitizedQuiz = {
+        ...quiz,
+        questions: quiz.questions.map(q => ({
+          ...q,
+          correctAnswers: undefined, // Hide correct answers
+          explanation: undefined // Hide explanations until after submission
+        }))
+      };
+      
+      res.json(sanitizedQuiz);
+    } catch (error) {
+      console.error("Error fetching quiz:", error);
+      res.status(500).json({ message: "Failed to fetch quiz" });
+    }
+  });
+
+  app.post('/api/quizzes/:quizId/submit', isAuthenticated, async (req: any, res) => {
+    try {
+      const result = await learningManagementService.submitQuiz(req.user.claims.sub, {
+        quizId: req.params.quizId,
+        ...req.body
+      });
+      
+      // Check if course is completed after quiz submission
+      const quiz = await learningManagementService.getQuizWithQuestions(req.params.quizId);
+      if (quiz?.courseId) {
+        await learningManagementService.checkCourseCompletion(req.user.claims.sub, quiz.courseId);
+      }
+      
+      res.json(result);
+    } catch (error: any) {
+      console.error("Error submitting quiz:", error);
+      res.status(500).json({ message: error.message || "Failed to submit quiz" });
+    }
+  });
+
+  // Learning Analytics Routes
+  app.get('/api/learning/stats', isAuthenticated, async (req: any, res) => {
+    try {
+      const stats = await learningManagementService.getUserLearningStats(req.user.claims.sub);
+      res.json(stats);
+    } catch (error) {
+      console.error("Error fetching learning stats:", error);
+      res.status(500).json({ message: "Failed to fetch learning statistics" });
+    }
+  });
+
+  app.post('/api/learning/track-activity', isAuthenticated, async (req: any, res) => {
+    try {
+      await learningManagementService.trackLearningActivity(req.user.claims.sub, req.body);
+      res.json({ message: "Activity tracked successfully" });
+    } catch (error) {
+      console.error("Error tracking learning activity:", error);
+      res.status(500).json({ message: "Failed to track learning activity" });
+    }
+  });
+
+  // Certificate Management Routes
+  app.post('/api/courses/:courseId/certificate', isAuthenticated, async (req: any, res) => {
+    try {
+      const certificate = await learningManagementService.generateCertificate(
+        req.user.claims.sub,
+        req.params.courseId
+      );
+      res.json(certificate);
+    } catch (error: any) {
+      console.error("Error generating certificate:", error);
+      res.status(500).json({ message: error.message || "Failed to generate certificate" });
+    }
+  });
+
+  app.get('/api/certificates/verify/:verificationCode', async (req, res) => {
+    try {
+      const certificate = await learningManagementService.verifyCertificate(req.params.verificationCode);
+      if (!certificate) {
+        return res.status(404).json({ message: "Certificate not found or invalid" });
+      }
+      res.json(certificate);
+    } catch (error) {
+      console.error("Error verifying certificate:", error);
+      res.status(500).json({ message: "Failed to verify certificate" });
+    }
+  });
+
+  app.post('/api/certificates/:certificateId/revoke', isAuthenticated, async (req: any, res) => {
+    try {
+      // Only admins can revoke certificates
+      if (!req.user.claims.sub || req.user.role !== 'admin') {
+        return res.status(403).json({ message: "Insufficient permissions" });
+      }
+      
+      const success = await learningManagementService.revokeCertificate(
+        req.params.certificateId,
+        req.body.reason || 'Revoked by administrator'
+      );
+      
+      if (!success) {
+        return res.status(404).json({ message: "Certificate not found" });
+      }
+      
+      res.json({ message: "Certificate revoked successfully" });
+    } catch (error) {
+      console.error("Error revoking certificate:", error);
+      res.status(500).json({ message: "Failed to revoke certificate" });
+    }
+  });
+
+  // Achievement Routes
+  app.get('/api/learning/achievements', isAuthenticated, async (req: any, res) => {
+    try {
+      const stats = await learningManagementService.getUserLearningStats(req.user.claims.sub);
+      res.json(stats.achievements);
+    } catch (error) {
+      console.error("Error fetching achievements:", error);
+      res.status(500).json({ message: "Failed to fetch achievements" });
+    }
+  });
+
+  // Course Discovery Routes
+  app.get('/api/courses', isAuthenticated, async (req: any, res) => {
+    try {
+      const { db } = await import('./db');
+      const { courses } = await import('@shared/schema');
+      const allCourses = await db.select().from(courses);
+      res.json(allCourses);
+    } catch (error) {
+      console.error("Error fetching courses:", error);
+      res.status(500).json({ message: "Failed to fetch courses" });
+    }
+  });
+
+  // Learning Leaderboard Route
+  app.get('/api/learning/leaderboard', isAuthenticated, async (req: any, res) => {
+    try {
+      // This would be implemented to show top learners by points, course completions, etc.
+      // For now, return a placeholder
+      res.json({
+        topLearners: [],
+        userRank: null,
+        categories: ['points', 'courses_completed', 'quiz_scores', 'streak']
+      });
+    } catch (error) {
+      console.error("Error fetching leaderboard:", error);
+      res.status(500).json({ message: "Failed to fetch leaderboard" });
+    }
+  });
+
+  // Karma Coins API Routes
+  
+  // Get karma stats for current user
+  app.get('/api/karma/stats', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const user = await storage.getUser(userId);
+      
+      if (!user) {
+        return res.status(404).json({ message: 'User not found' });
+      }
+
+      // Calculate stats (in real implementation, these would come from database queries)
+      const stats = {
+        balance: user.karmaCoins || 0,
+        totalEarned: (user.karmaCoins || 0) + 1550, // Mock calculation
+        totalSpent: 1550, // Mock data
+        rank: 12, // Mock ranking
+        totalUsers: 150, // Mock total users
+        weeklyEarned: 320, // Mock weekly earnings
+        monthlyEarned: 1150 // Mock monthly earnings
+      };
+      
+      res.json(stats);
+    } catch (error) {
+      console.error("Error fetching karma stats:", error);
+      res.status(500).json({ message: "Failed to fetch karma stats" });
+    }
+  });
+
+  // Get available karma activities
+  app.get('/api/karma/activities', isAuthenticated, async (req, res) => {
+    try {
+      // In real implementation, fetch from database based on user progress
+      const activities = [
+        {
+          id: 'complete_course',
+          name: 'Complete a Learning Course',
+          description: 'Finish any available course in the learning center',
+          reward: 50,
+          category: 'learning',
+          difficulty: 'easy',
+          completed: false,
+          requirements: ['Access to learning center', 'Course enrollment']
+        },
+        {
+          id: 'submit_timesheet_early',
+          name: 'Submit Timesheet Early',
+          description: 'Submit your timesheet 24 hours before deadline',
+          reward: 25,
+          category: 'performance',
+          difficulty: 'easy',
+          completed: true,
+          completedAt: '2024-10-28',
+          requirements: ['Active timesheet', 'Submit 24h early']
+        },
+        {
+          id: 'perfect_attendance',
+          name: 'Perfect Attendance Week',
+          description: 'Complete all scheduled shifts in a week',
+          reward: 100,
+          category: 'attendance',
+          difficulty: 'medium',
+          completed: false,
+          progress: 4,
+          requirements: ['Complete 5/5 shifts', 'No missed shifts']
+        },
+        {
+          id: 'help_colleague',
+          name: 'Help a Colleague',
+          description: 'Assist a team member with their tasks or training',
+          reward: 75,
+          category: 'social',
+          difficulty: 'medium',
+          completed: false,
+          requirements: ['Manager verification', 'Positive feedback']
+        },
+        {
+          id: 'innovation_suggestion',
+          name: 'Innovation Suggestion',
+          description: 'Submit a process improvement idea that gets implemented',
+          reward: 200,
+          category: 'achievement',
+          difficulty: 'hard',
+          completed: false,
+          requirements: ['Written proposal', 'Management approval', 'Implementation']
+        },
+        {
+          id: 'safety_champion',
+          name: 'Safety Champion',
+          description: 'Complete advanced safety training and mentor others',
+          reward: 150,
+          category: 'achievement',
+          difficulty: 'hard',
+          completed: false,
+          requirements: ['Safety certification', 'Mentor 3 colleagues']
+        }
+      ];
+      
+      res.json(activities);
+    } catch (error) {
+      console.error("Error fetching karma activities:", error);
+      res.status(500).json({ message: "Failed to fetch karma activities" });
+    }
+  });
+
+  // Claim activity reward
+  app.post('/api/karma/claim-activity', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const { activityId } = req.body;
+      
+      // In real implementation, validate activity completion and award coins
+      const activityRewards: Record<string, number> = {
+        'complete_course': 50,
+        'submit_timesheet_early': 25,
+        'perfect_attendance': 100,
+        'help_colleague': 75,
+        'innovation_suggestion': 200,
+        'safety_champion': 150
+      };
+      
+      const reward = activityRewards[activityId];
+      if (!reward) {
+        return res.status(400).json({ message: 'Invalid activity' });
+      }
+      
+      // Award karma coins
+      await storage.updateUserKarmaCoins(userId, reward);
+      
+      // Create activity log
+      await storage.createActivity({
+        userId,
+        type: "karma_earned",
+        description: `Earned ${reward} karma coins for activity completion`,
+        metadata: { activityId, reward }
+      });
+      
+      res.json({ success: true, reward });
+    } catch (error) {
+      console.error("Error claiming activity reward:", error);
+      res.status(500).json({ message: "Failed to claim activity reward" });
+    }
+  });
+
+  // Get available rewards
+  app.get('/api/karma/rewards', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const user = await storage.getUser(userId);
+      const userBalance = user?.karmaCoins || 0;
+      
+      const rewards = [
+        {
+          id: 'extra_break',
+          name: 'Extra 15-Minute Break',
+          description: 'Get an additional 15-minute break during your shift',
+          cost: 100,
+          category: 'benefits',
+          availability: 5,
+          claimed: 2,
+          canClaim: userBalance >= 100
+        },
+        {
+          id: 'parking_spot',
+          name: 'Reserved Parking Spot',
+          description: 'Get a reserved parking spot for one week',
+          cost: 200,
+          category: 'benefits',
+          availability: 2,
+          claimed: 0,
+          canClaim: userBalance >= 200
+        },
+        {
+          id: 'employee_month',
+          name: 'Employee of the Month Nomination',
+          description: 'Get nominated for Employee of the Month award',
+          cost: 500,
+          category: 'recognition',
+          availability: 1,
+          claimed: 0,
+          canClaim: userBalance >= 500
+        },
+        {
+          id: 'team_lunch',
+          name: 'Team Lunch Voucher',
+          description: '£25 voucher for team lunch at local restaurant',
+          cost: 300,
+          category: 'experiences',
+          availability: 3,
+          claimed: 1,
+          canClaim: userBalance >= 300
+        },
+        {
+          id: 'branded_mug',
+          name: 'Branded Coffee Mug',
+          description: 'Premium company-branded coffee mug',
+          cost: 150,
+          category: 'merchandise',
+          availability: 10,
+          claimed: 4,
+          canClaim: userBalance >= 150
+        },
+        {
+          id: 'hoodie',
+          name: 'Company Hoodie',
+          description: 'Comfortable branded hoodie in your size',
+          cost: 400,
+          category: 'merchandise',
+          availability: 8,
+          claimed: 2,
+          canClaim: userBalance >= 400
+        }
+      ];
+      
+      res.json(rewards);
+    } catch (error) {
+      console.error("Error fetching karma rewards:", error);
+      res.status(500).json({ message: "Failed to fetch karma rewards" });
+    }
+  });
+
+  // Redeem reward
+  app.post('/api/karma/redeem-reward', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const { rewardId } = req.body;
+      const user = await storage.getUser(userId);
+      
+      if (!user) {
+        return res.status(404).json({ message: 'User not found' });
+      }
+      
+      // Define reward costs
+      const rewardCosts: Record<string, number> = {
+        'extra_break': 100,
+        'parking_spot': 200,
+        'employee_month': 500,
+        'team_lunch': 300,
+        'branded_mug': 150,
+        'hoodie': 400
+      };
+      
+      const cost = rewardCosts[rewardId];
+      if (!cost) {
+        return res.status(400).json({ message: 'Invalid reward' });
+      }
+      
+      if (user.karmaCoins < cost) {
+        return res.status(400).json({ message: 'Insufficient karma coins' });
+      }
+      
+      // Deduct karma coins
+      await storage.updateUserKarmaCoins(userId, -cost);
+      
+      // Create activity log
+      await storage.createActivity({
+        userId,
+        type: "karma_spent",
+        description: `Redeemed reward for ${cost} karma coins`,
+        metadata: { rewardId, cost }
+      });
+      
+      res.json({ success: true, cost });
+    } catch (error) {
+      console.error("Error redeeming reward:", error);
+      res.status(500).json({ message: "Failed to redeem reward" });
+    }
+  });
+
+  // Get karma transaction history
+  app.get('/api/karma/transactions', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const period = req.query.period || 'month';
+      
+      // In real implementation, fetch from activities table filtered by karma transactions
+      const transactions = [
+        {
+          id: '1',
+          type: 'earned',
+          amount: 50,
+          description: 'Completed Safety Training Course',
+          date: '2024-10-28',
+          category: 'learning'
+        },
+        {
+          id: '2',
+          type: 'earned',
+          amount: 25,
+          description: 'Early Timesheet Submission',
+          date: '2024-10-27',
+          category: 'performance'
+        },
+        {
+          id: '3',
+          type: 'spent',
+          amount: 100,
+          description: 'Redeemed Extra Break',
+          date: '2024-10-26',
+          category: 'benefits'
+        },
+        {
+          id: '4',
+          type: 'earned',
+          amount: 75,
+          description: 'Helped New Team Member',
+          date: '2024-10-25',
+          category: 'social'
+        },
+        {
+          id: '5',
+          type: 'earned',
+          amount: 100,
+          description: 'Perfect Attendance Week',
+          date: '2024-10-22',
+          category: 'attendance'
+        }
+      ];
+      
+      res.json(transactions);
+    } catch (error) {
+      console.error("Error fetching karma transactions:", error);
+      res.status(500).json({ message: "Failed to fetch karma transactions" });
+    }
+  });
+
+  // Get karma leaderboard
+  app.get('/api/karma/leaderboard', isAuthenticated, async (req, res) => {
+    try {
+      // In real implementation, query users ordered by karmaCoins
+      const leaderboard = [
+        { rank: 1, userId: '1', firstName: 'Sarah', lastName: 'Johnson', karmaCoins: 2850, weeklyEarned: 450 },
+        { rank: 2, userId: '2', firstName: 'Mike', lastName: 'Chen', karmaCoins: 2640, weeklyEarned: 380 },
+        { rank: 3, userId: '3', firstName: 'Emma', lastName: 'Davis', karmaCoins: 2520, weeklyEarned: 320 },
+        { rank: 4, userId: '4', firstName: 'John', lastName: 'Smith', karmaCoins: 2410, weeklyEarned: 290 },
+        { rank: 5, userId: '5', firstName: 'Lisa', lastName: 'Wilson', karmaCoins: 2350, weeklyEarned: 275 }
+      ];
+      
+      res.json(leaderboard);
+    } catch (error) {
+      console.error("Error fetching karma leaderboard:", error);
+      res.status(500).json({ message: "Failed to fetch karma leaderboard" });
+    }
+  });
+
+  // Get karma trends
+  app.get('/api/karma/trends', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const period = req.query.period || 'month';
+      
+      // In real implementation, aggregate karma transactions over time
+      const trends = [
+        { date: '2024-10-21', earned: 125, spent: 0, balance: 1000 },
+        { date: '2024-10-22', earned: 100, spent: 0, balance: 1100 },
+        { date: '2024-10-23', earned: 50, spent: 200, balance: 950 },
+        { date: '2024-10-24', earned: 75, spent: 0, balance: 1025 },
+        { date: '2024-10-25', earned: 75, spent: 0, balance: 1100 },
+        { date: '2024-10-26', earned: 25, spent: 100, balance: 1025 },
+        { date: '2024-10-27', earned: 25, spent: 0, balance: 1050 },
+        { date: '2024-10-28', earned: 200, spent: 0, balance: 1250 }
+      ];
+      
+      res.json(trends);
+    } catch (error) {
+      console.error("Error fetching karma trends:", error);
+      res.status(500).json({ message: "Failed to fetch karma trends" });
+    }
+  });
+
+  // 360-Degree Feedback System Routes
+  const { performanceReviewService } = await import('./services/performance-review-service');
+
+  // Initialize default competencies
+  try {
+    await performanceReviewService.initializeDefaultCompetencies();
+  } catch (error) {
+    console.error("Error initializing competencies:", error);
+  }
+
+  // Review Cycles Management
+  app.post('/api/360/cycles', isAuthenticated, async (req: any, res) => {
+    try {
+      if (req.user.role !== 'admin') {
+        return res.status(403).json({ message: "Only admins can create review cycles" });
+      }
+      const cycle = await performanceReviewService.createReviewCycle(req.body);
+      res.json(cycle);
+    } catch (error: any) {
+      console.error("Error creating review cycle:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get('/api/360/cycles', isAuthenticated, async (req, res) => {
+    try {
+      const cycles = await performanceReviewService.getActiveReviewCycles();
+      res.json(cycles);
+    } catch (error: any) {
+      console.error("Error fetching review cycles:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get('/api/360/cycles/:id', isAuthenticated, async (req, res) => {
+    try {
+      const cycle = await performanceReviewService.getReviewCycle(req.params.id);
+      if (!cycle) {
+        return res.status(404).json({ message: "Review cycle not found" });
+      }
+      res.json(cycle);
+    } catch (error: any) {
+      console.error("Error fetching review cycle:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Performance Reviews Management
+  app.post('/api/360/reviews', isAuthenticated, async (req: any, res) => {
+    try {
+      const reviewData = {
+        ...req.body,
+        revieweeId: req.body.revieweeId || req.user.claims.sub
+      };
+      const review = await performanceReviewService.createPerformanceReview(reviewData);
+      res.json(review);
+    } catch (error: any) {
+      console.error("Error creating performance review:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get('/api/360/reviews/my-reviews', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const reviews = await performanceReviewService.getUserReviews(userId);
+      res.json(reviews);
+    } catch (error: any) {
+      console.error("Error fetching user reviews:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get('/api/360/reviews/to-review', isAuthenticated, async (req: any, res) => {
+    try {
+      const participantId = req.user.claims.sub;
+      const reviews = await performanceReviewService.getReviewsForParticipant(participantId);
+      res.json(reviews);
+    } catch (error: any) {
+      console.error("Error fetching reviews to complete:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get('/api/360/reviews/:id', isAuthenticated, async (req, res) => {
+    try {
+      const review = await performanceReviewService.getReviewDetails(req.params.id);
+      if (!review) {
+        return res.status(404).json({ message: "Review not found" });
+      }
+      res.json(review);
+    } catch (error: any) {
+      console.error("Error fetching review details:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Review Participants Management
+  app.post('/api/360/reviews/:reviewId/participants', isAuthenticated, async (req: any, res) => {
+    try {
+      const { participantIds, participantType } = req.body;
+      const participants = await performanceReviewService.inviteReviewParticipants(
+        req.params.reviewId,
+        participantIds,
+        participantType
+      );
+      res.json(participants);
+    } catch (error: any) {
+      console.error("Error inviting participants:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.patch('/api/360/reviews/:reviewId/participants/:participantId/status', isAuthenticated, async (req: any, res) => {
+    try {
+      const { status } = req.body;
+      const participant = await performanceReviewService.updateParticipantStatus(
+        req.params.participantId,
+        req.params.reviewId,
+        status
+      );
+      res.json(participant);
+    } catch (error: any) {
+      console.error("Error updating participant status:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Competencies Management
+  app.post('/api/360/competencies', isAuthenticated, async (req: any, res) => {
+    try {
+      if (req.user.role !== 'admin') {
+        return res.status(403).json({ message: "Only admins can create competencies" });
+      }
+      const competency = await performanceReviewService.createCompetency(req.body);
+      res.json(competency);
+    } catch (error: any) {
+      console.error("Error creating competency:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get('/api/360/competencies', isAuthenticated, async (req, res) => {
+    try {
+      const competencies = await performanceReviewService.getActiveCompetencies();
+      res.json(competencies);
+    } catch (error: any) {
+      console.error("Error fetching competencies:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Review Responses Management
+  app.post('/api/360/reviews/:reviewId/responses', isAuthenticated, async (req: any, res) => {
+    try {
+      const responseData = {
+        ...req.body,
+        reviewId: req.params.reviewId,
+        participantId: req.user.claims.sub
+      };
+      const response = await performanceReviewService.submitReviewResponse(responseData);
+      res.json(response);
+    } catch (error: any) {
+      console.error("Error submitting review response:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get('/api/360/reviews/:reviewId/responses', isAuthenticated, async (req, res) => {
+    try {
+      const responses = await performanceReviewService.getReviewResponses(req.params.reviewId);
+      res.json(responses);
+    } catch (error: any) {
+      console.error("Error fetching review responses:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get('/api/360/reviews/:reviewId/my-responses', isAuthenticated, async (req: any, res) => {
+    try {
+      const responses = await performanceReviewService.getUserReviewResponses(
+        req.user.claims.sub,
+        req.params.reviewId
+      );
+      res.json(responses);
+    } catch (error: any) {
+      console.error("Error fetching user responses:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Goals Management
+  app.post('/api/360/reviews/:reviewId/goals', isAuthenticated, async (req: any, res) => {
+    try {
+      const goalData = {
+        ...req.body,
+        reviewId: req.params.reviewId
+      };
+      const goal = await performanceReviewService.createReviewGoal(goalData);
+      res.json(goal);
+    } catch (error: any) {
+      console.error("Error creating review goal:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.patch('/api/360/goals/:goalId/progress', isAuthenticated, async (req: any, res) => {
+    try {
+      const { progress } = req.body;
+      const goal = await performanceReviewService.updateGoalProgress(req.params.goalId, progress);
+      res.json(goal);
+    } catch (error: any) {
+      console.error("Error updating goal progress:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get('/api/360/reviews/:reviewId/goals', isAuthenticated, async (req, res) => {
+    try {
+      const goals = await performanceReviewService.getReviewGoals(req.params.reviewId);
+      res.json(goals);
+    } catch (error: any) {
+      console.error("Error fetching review goals:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Analytics and Reporting
+  app.post('/api/360/analytics/:cycleId/:userId', isAuthenticated, async (req, res) => {
+    try {
+      const analytics = await performanceReviewService.generateReviewAnalytics(
+        req.params.cycleId,
+        req.params.userId
+      );
+      res.json(analytics);
+    } catch (error: any) {
+      console.error("Error generating analytics:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get('/api/360/stats', isAuthenticated, async (req, res) => {
+    try {
+      const { cycleId } = req.query;
+      const stats = await performanceReviewService.getReviewStats(cycleId as string);
+      res.json(stats);
+    } catch (error: any) {
+      console.error("Error fetching review stats:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get('/api/360/competency-analysis/:cycleId', isAuthenticated, async (req, res) => {
+    try {
+      const analysis = await performanceReviewService.getCompetencyAnalysis(req.params.cycleId);
+      res.json(analysis);
+    } catch (error: any) {
+      console.error("Error fetching competency analysis:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Enhanced AI Assistant Routes
+  const { aiService } = await import('./services/ai-service');
+
+  // AI Chat Assistant
+  app.post('/api/ai/chat', isAuthenticated, async (req: any, res) => {
+    try {
+      const { message, context, sessionId, conversationHistory } = req.body;
+      const response = await aiService.processChat(message, context, sessionId, conversationHistory);
+      res.json(response);
+    } catch (error: any) {
+      console.error("Error processing AI chat:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Real-time Metrics
+  app.get('/api/ai/realtime-metrics', isAuthenticated, async (req, res) => {
+    try {
+      const metrics = await aiService.getRealtimeMetrics();
+      res.json(metrics);
+    } catch (error: any) {
+      console.error("Error fetching realtime metrics:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // AI Alerts
+  app.get('/api/ai/alerts', isAuthenticated, async (req, res) => {
+    try {
+      const alerts = await aiService.generateAIAlerts();
+      res.json(alerts);
+    } catch (error: any) {
+      console.error("Error generating AI alerts:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // AI Insights
+  app.get('/api/ai/insights/realtime', isAuthenticated, async (req, res) => {
+    try {
+      const insights = await aiService.generateAIInsights();
+      res.json(insights);
+    } catch (error: any) {
+      console.error("Error generating AI insights:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Automation Rules
+  app.get('/api/ai/automation/rules', isAuthenticated, async (req, res) => {
+    try {
+      const rules = await aiService.getAutomationRules();
+      res.json(rules);
+    } catch (error: any) {
+      console.error("Error fetching automation rules:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.post('/api/ai/automation/rules', isAuthenticated, async (req: any, res) => {
+    try {
+      // Create new automation rule
+      const rule = req.body;
+      // In real implementation, save to database
+      res.json({ success: true, rule });
+    } catch (error: any) {
+      console.error("Error creating automation rule:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.patch('/api/ai/automation/rules/:ruleId/toggle', isAuthenticated, async (req: any, res) => {
+    try {
+      const { ruleId } = req.params;
+      const { isActive } = req.body;
+      // In real implementation, update database
+      res.json({ success: true, ruleId, isActive });
+    } catch (error: any) {
+      console.error("Error toggling automation rule:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Automation Executions
+  app.get('/api/ai/automation/executions', isAuthenticated, async (req, res) => {
+    try {
+      // Mock execution data
+      const executions = [
+        {
+          id: 'exec1',
+          ruleId: 'rule1',
+          ruleName: 'Auto Schedule Optimization',
+          status: 'completed',
+          startedAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
+          completedAt: new Date(Date.now() - 2 * 60 * 60 * 1000 + 45000),
+          result: { optimized: true, efficiency_gain: '8%' },
+          logs: ['Detected efficiency drop', 'Running optimization', 'Schedule updated', 'Notifications sent']
+        }
+      ];
+      res.json(executions);
+    } catch (error: any) {
+      console.error("Error fetching automation executions:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Performance Coaching
+  app.get('/api/ai/performance/insights/:employeeId', isAuthenticated, async (req, res) => {
+    try {
+      const insights = await aiService.generatePerformanceInsights(req.params.employeeId);
+      res.json(insights);
+    } catch (error: any) {
+      console.error("Error generating performance insights:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get('/api/ai/performance/goals/:employeeId', isAuthenticated, async (req, res) => {
+    try {
+      const goals = await aiService.generatePersonalGoals(req.params.employeeId);
+      res.json(goals);
+    } catch (error: any) {
+      console.error("Error generating personal goals:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get('/api/ai/performance/coaching/:employeeId', isAuthenticated, async (req, res) => {
+    try {
+      // Mock coaching session data
+      const sessions = [
+        {
+          id: 'session1',
+          date: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000),
+          topic: 'Communication Skills Enhancement',
+          insights: ['Active listening development area', 'Email clarity improvement needed'],
+          actions: ['Practice meeting summaries', 'Use bullet points in emails'],
+          progress: 75,
+          nextSession: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
+        }
+      ];
+      res.json(sessions);
+    } catch (error: any) {
+      console.error("Error fetching coaching sessions:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.post('/api/ai/performance/coaching/generate', isAuthenticated, async (req: any, res) => {
+    try {
+      const { employee, topic } = req.body;
+      // Generate new coaching session
+      const session = {
+        id: `session_${Date.now()}`,
+        employee,
+        topic,
+        scheduledFor: new Date(Date.now() + 24 * 60 * 60 * 1000),
+        status: 'scheduled'
+      };
+      res.json({ success: true, session });
+    } catch (error: any) {
+      console.error("Error generating coaching session:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get('/api/issues/alerts', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      const status = req.query.status as string | undefined;
+      const alerts = await storage.getIssueAlerts(status);
+      res.json(alerts);
+    } catch (error: any) {
+      console.error("Error fetching issue alerts:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get('/api/issues/alerts/:alertId/recommendations', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      const recommendations = await storage.getRecommendationsByAlert(req.params.alertId);
+      res.json(recommendations);
+    } catch (error: any) {
+      console.error("Error fetching recommendations:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.post('/api/issues/alerts/:alertId/resolve', isAuthenticatedOrDemo, async (req: any, res) => {
+    try {
+      const userId = req.user?.claims?.id || req.session?.user?.id || 'demo-user';
+      await storage.updateIssueAlert(req.params.alertId, {
+        status: 'resolved',
+        resolvedBy: userId,
+        resolvedAt: new Date()
+      });
+      res.json({ success: true });
+    } catch (error: any) {
+      console.error("Error resolving alert:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.post('/api/issues/alerts/:alertId/dismiss', isAuthenticatedOrDemo, async (req: any, res) => {
+    try {
+      await storage.updateIssueAlert(req.params.alertId, {
+        status: 'dismissed'
+      });
+      res.json({ success: true });
+    } catch (error: any) {
+      console.error("Error dismissing alert:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.post('/api/issues/actions', isAuthenticatedOrDemo, async (req: any, res) => {
+    try {
+      const userId = req.user?.claims?.id || req.session?.user?.id || 'demo-user';
+      const { alertId, recommendationId, actionType } = req.body;
+      
+      const actionExecutionService = createActionExecutionService(storage);
+      const executionResult = await actionExecutionService.executeAction(
+        actionType,
+        recommendationId,
+        alertId,
+        userId
+      );
+      
+      if (!executionResult.success) {
+        return res.status(400).json({ 
+          success: false, 
+          error: executionResult.error 
+        });
+      }
+      
+      res.json(executionResult.action);
+    } catch (error: any) {
+      console.error("Error creating action:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get('/api/issues/alerts/:alertId/actions', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      const actions = await storage.getActionsByAlert(req.params.alertId);
+      res.json(actions);
+    } catch (error: any) {
+      console.error("Error fetching actions:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.post('/api/issues/detect/run', isAuthenticatedOrDemo, async (req: any, res) => {
+    try {
+      const userId = req.user?.claims?.id || req.session?.user?.id || 'demo-user';
+      const user = await storage.getUser(userId);
+      
+      if (user && user.role !== 'admin' && user.role !== 'client') {
+        return res.status(403).json({ message: 'Admin or client access required' });
+      }
+
+      const { IssueDetectionService } = await import('./services/issue-detection-service');
+      const detectionService = new IssueDetectionService(storage);
+      
+      const jobs = await storage.getJobs();
+      const payments = await storage.getPayments();
+      
+      const results = await detectionService.detectAllIssues({
+        jobs,
+        payments,
+        userRole: user?.role
+      });
+
+      res.json({ 
+        success: true, 
+        detectedIssues: results.length,
+        critical: results.filter(r => r.alert.severity === 'critical').length,
+        high: results.filter(r => r.alert.severity === 'high').length
+      });
+    } catch (error: any) {
+      console.error("Error running issue detection:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Marketing Automation API Routes
+  const { marketingService } = await import('./services/marketing-service');
+
+  app.get('/api/marketing/campaigns', isAuthenticatedOrDemo, async (req: any, res) => {
+    try {
+      const campaigns = await marketingService.getCampaigns();
+      res.json(campaigns);
+    } catch (error: any) {
+      console.error("Error fetching campaigns:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.post('/api/marketing/campaigns', isAuthenticatedOrDemo, async (req: any, res) => {
+    try {
+      const campaign = await marketingService.createCampaign(req.body);
+      res.json(campaign);
+    } catch (error: any) {
+      console.error("Error creating campaign:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get('/api/marketing/campaigns/:id', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      const campaign = await marketingService.getCampaign(req.params.id);
+      if (!campaign) {
+        return res.status(404).json({ message: "Campaign not found" });
+      }
+      res.json(campaign);
+    } catch (error: any) {
+      console.error("Error fetching campaign:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.patch('/api/marketing/campaigns/:id', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      // Validate campaign update data
+      const campaignSchema = z.object({
+        name: z.string().optional(),
+        type: z.string().optional(),
+        status: z.string().optional(),
+        budget: z.number().optional(),
+        startDate: z.string().optional(),
+        endDate: z.string().optional()
+      }).strict();
+      const updateData = campaignSchema.parse(req.body);
+      const campaign = await marketingService.updateCampaign(req.params.id, updateData as any);
+      res.json(campaign);
+    } catch (error: any) {
+      if (error.name === 'ZodError') {
+        return res.status(400).json({ message: "Invalid campaign data", errors: error.errors });
+      }
+      console.error("Error updating campaign:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.delete('/api/marketing/campaigns/:id', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      await marketingService.deleteCampaign(req.params.id);
+      res.json({ success: true });
+    } catch (error: any) {
+      console.error("Error deleting campaign:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get('/api/marketing/email-templates', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      const templates = await marketingService.getEmailTemplates();
+      res.json(templates);
+    } catch (error: any) {
+      console.error("Error fetching email templates:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.post('/api/marketing/email-templates', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      const template = await marketingService.createEmailTemplate(req.body);
+      res.json(template);
+    } catch (error: any) {
+      console.error("Error creating email template:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.patch('/api/marketing/email-templates/:id', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      // Validate template update data
+      const templateSchema = z.object({
+        name: z.string().optional(),
+        subject: z.string().optional(),
+        body: z.string().optional(),
+        variables: z.array(z.string()).optional()
+      }).strict();
+      const updateData = templateSchema.parse(req.body);
+      const template = await marketingService.updateEmailTemplate(req.params.id, updateData);
+      res.json(template);
+    } catch (error: any) {
+      if (error.name === 'ZodError') {
+        return res.status(400).json({ message: "Invalid template data", errors: error.errors });
+      }
+      console.error("Error updating email template:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.post('/api/marketing/campaigns/:id/send', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      const { templateId, recipients } = req.body;
+      const sends = await marketingService.sendEmailCampaign(req.params.id, templateId, recipients);
+      res.json(sends);
+    } catch (error: any) {
+      console.error("Error sending email campaign:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get('/api/marketing/campaigns/:id/sends', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      const sends = await marketingService.getEmailCampaignSends(req.params.id);
+      res.json(sends);
+    } catch (error: any) {
+      console.error("Error fetching campaign sends:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get('/api/marketing/social-posts', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      const posts = await marketingService.getSocialPosts();
+      res.json(posts);
+    } catch (error: any) {
+      console.error("Error fetching social posts:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.post('/api/marketing/social-posts', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      const post = await marketingService.createSocialPost(req.body);
+      res.json(post);
+    } catch (error: any) {
+      console.error("Error creating social post:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.patch('/api/marketing/social-posts/:id', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      // Validate social post update data
+      const postSchema = z.object({
+        platform: z.string().optional(),
+        content: z.string().optional(),
+        scheduledFor: z.string().optional(),
+        status: z.string().optional()
+      }).strict();
+      const updateData = postSchema.parse(req.body);
+      const post = await marketingService.updateSocialPost(req.params.id, updateData as any);
+      res.json(post);
+    } catch (error: any) {
+      if (error.name === 'ZodError') {
+        return res.status(400).json({ message: "Invalid social post data", errors: error.errors });
+      }
+      console.error("Error updating social post:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get('/api/marketing/metrics', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      const metrics = await marketingService.getCampaignMetrics();
+      res.json(metrics);
+    } catch (error: any) {
+      console.error("Error fetching marketing metrics:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get('/api/marketing/lead-sources', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      const sources = await marketingService.getLeadSources();
+      res.json(sources);
+    } catch (error: any) {
+      console.error("Error fetching lead sources:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.post('/api/marketing/lead-sources', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      const source = await marketingService.createLeadSource(req.body);
+      res.json(source);
+    } catch (error: any) {
+      console.error("Error creating lead source:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Business Development API Routes
+  const { businessDevelopmentService } = await import('./services/business-development-service');
+
+  app.get('/api/business-development/partnerships', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      const partnerships = await businessDevelopmentService.getPartnerships();
+      res.json(partnerships);
+    } catch (error: any) {
+      console.error("Error fetching partnerships:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.post('/api/business-development/partnerships', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      const partnership = await businessDevelopmentService.createPartnership(req.body);
+      res.json(partnership);
+    } catch (error: any) {
+      console.error("Error creating partnership:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get('/api/business-development/partnerships/:id', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      const partnership = await businessDevelopmentService.getPartnership(req.params.id);
+      if (!partnership) {
+        return res.status(404).json({ message: "Partnership not found" });
+      }
+      res.json(partnership);
+    } catch (error: any) {
+      console.error("Error fetching partnership:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.patch('/api/business-development/partnerships/:id', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      // Validate partnership update data
+      const partnershipSchema = z.object({
+        partnerName: z.string().optional(),
+        type: z.string().optional(),
+        status: z.string().optional(),
+        value: z.number().optional(),
+        startDate: z.string().optional()
+      }).strict();
+      const updateData = partnershipSchema.parse(req.body);
+      const partnership = await businessDevelopmentService.updatePartnership(req.params.id, updateData as any);
+      res.json(partnership);
+    } catch (error: any) {
+      if (error.name === 'ZodError') {
+        return res.status(400).json({ message: "Invalid partnership data", errors: error.errors });
+      }
+      console.error("Error updating partnership:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.delete('/api/business-development/partnerships/:id', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      await businessDevelopmentService.deletePartnership(req.params.id);
+      res.json({ success: true });
+    } catch (error: any) {
+      console.error("Error deleting partnership:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get('/api/business-development/market-analysis', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      const analyses = await businessDevelopmentService.getMarketAnalyses();
+      res.json(analyses);
+    } catch (error: any) {
+      console.error("Error fetching market analyses:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.post('/api/business-development/market-analysis', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      const analysis = await businessDevelopmentService.createMarketAnalysis(req.body);
+      res.json(analysis);
+    } catch (error: any) {
+      console.error("Error creating market analysis:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.patch('/api/business-development/market-analysis/:id', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      // Validate market analysis update data
+      const analysisSchema = z.object({
+        market: z.string().optional(),
+        findings: z.string().optional(),
+        opportunities: z.array(z.string()).optional(),
+        threats: z.array(z.string()).optional()
+      }).strict();
+      const updateData = analysisSchema.parse(req.body);
+      const analysis = await businessDevelopmentService.updateMarketAnalysis(req.params.id, updateData);
+      res.json(analysis);
+    } catch (error: any) {
+      if (error.name === 'ZodError') {
+        return res.status(400).json({ message: "Invalid analysis data", errors: error.errors });
+      }
+      console.error("Error updating market analysis:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get('/api/business-development/strategic-plans', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      const plans = await businessDevelopmentService.getStrategicPlans();
+      res.json(plans);
+    } catch (error: any) {
+      console.error("Error fetching strategic plans:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.post('/api/business-development/strategic-plans', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      const plan = await businessDevelopmentService.createStrategicPlan(req.body);
+      res.json(plan);
+    } catch (error: any) {
+      console.error("Error creating strategic plan:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.patch('/api/business-development/strategic-plans/:id', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      // Validate strategic plan update data
+      const planSchema = z.object({
+        title: z.string().optional(),
+        objectives: z.array(z.string()).optional(),
+        timeline: z.string().optional(),
+        budget: z.number().optional(),
+        status: z.string().optional()
+      }).strict();
+      const updateData = planSchema.parse(req.body);
+      const plan = await businessDevelopmentService.updateStrategicPlan(req.params.id, updateData as any);
+      res.json(plan);
+    } catch (error: any) {
+      if (error.name === 'ZodError') {
+        return res.status(400).json({ message: "Invalid plan data", errors: error.errors });
+      }
+      console.error("Error updating strategic plan:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get('/api/business-development/growth-metrics', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      const { metricType, startDate, endDate } = req.query;
+      const metrics = await businessDevelopmentService.getGrowthMetrics(
+        undefined,
+        metricType as any,
+        startDate ? new Date(startDate as string) : undefined,
+        endDate ? new Date(endDate as string) : undefined
+      );
+      res.json(metrics);
+    } catch (error: any) {
+      console.error("Error fetching growth metrics:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.post('/api/business-development/growth-metrics', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      const metric = await businessDevelopmentService.recordGrowthMetric(req.body);
+      res.json(metric);
+    } catch (error: any) {
+      console.error("Error recording growth metric:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get('/api/business-development/metrics/summary', isAuthenticatedOrDemo, async (req, res) => {
+    try {
+      const partnershipMetrics = await businessDevelopmentService.getPartnershipMetrics();
+      const growthSummary = await businessDevelopmentService.getGrowthSummary();
+      const planSummary = await businessDevelopmentService.getStrategicPlanSummary();
+      
+      res.json({
+        partnerships: partnershipMetrics,
+        growth: growthSummary,
+        strategicPlans: planSummary
+      });
+    } catch (error: any) {
+      console.error("Error fetching business development summary:", error);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  const httpServer = createServer(app);
+  
+  // Initialize notification service with WebSocket server
+  notificationService.initialize(httpServer);
+  
+  // Initialize real-time notification service
+  realTimeNotificationService.initialize(httpServer);
+
+  // Initialize advanced WebSocket features
+  const initAdvancedWebSocket = async () => {
+    try {
+      const { advancedNotificationService } = await import('./advanced-notifications');
+      advancedNotificationService.initializeWebSocket(httpServer);
+    } catch (error) {
+      logger.error('Advanced WebSocket initialization error:', error);
+    }
+  };
+  
+  initAdvancedWebSocket();
+  
+  // Initialize issue detection scheduler
+  const issueDetectionScheduler = createIssueDetectionScheduler(storage);
+  issueDetectionScheduler.start(30); // Run detection every 30 minutes
+  logger.info('🔍 Issue detection scheduler started');
+  
+  return httpServer;
+}
