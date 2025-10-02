@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kin2-workforce
+  labels:
+    name: kin2-workforce
+    app: kin2-workforce-platform
