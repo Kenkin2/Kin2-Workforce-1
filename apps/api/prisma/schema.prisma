@@ -1,0 +1,316 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  WORKER
+  CLIENT  
+  ADMIN
+}
+
+enum JobStatus {
+  DRAFT
+  ACTIVE
+  PAUSED
+  COMPLETED
+  CANCELLED
+}
+
+enum ShiftStatus {
+  SCHEDULED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+enum TimesheetStatus {
+  DRAFT
+  SUBMITTED
+  APPROVED
+  REJECTED
+  PAID
+}
+
+enum PaymentStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  firstName String?
+  lastName  String?
+  role      UserRole @default(WORKER)
+  
+  // Stripe Connect fields
+  stripeConnectAccountId String?
+  stripeCustomerId       String?
+  onboardingComplete     Boolean @default(false)
+  
+  // Timestamps
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  // Relations
+  jobsCreated  Job[]       @relation("JobCreator")
+  jobsAssigned Job[]       @relation("JobAssignee")
+  shifts       Shift[]
+  timesheets   Timesheet[]
+  payments     Payment[]   @relation("PaymentRecipient")
+  auditLogs    AuditLog[]
+  
+  @@map("users")
+}
+
+model Organization {
+  id          String  @id @default(cuid())
+  name        String
+  slug        String  @unique
+  description String?
+  
+  // Industry classification
+  sicCode   String? // Standard Industrial Classification
+  naicsCode String? // North American Industry Classification System
+  
+  // Settings
+  settings Json @default("{}")
+  
+  // Timestamps
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  // Relations
+  jobs      Job[]
+  shifts    Shift[]
+  payments  Payment[]
+  auditLogs AuditLog[]
+  
+  @@map("organizations")
+}
+
+model Job {
+  id          String    @id @default(cuid())
+  title       String
+  description String?
+  status      JobStatus @default(DRAFT)
+  
+  // Assignment
+  createdById String
+  createdBy   User   @relation("JobCreator", fields: [createdById], references: [id])
+  assignedId  String?
+  assigned    User?  @relation("JobAssignee", fields: [assignedId], references: [id])
+  
+  // Organization
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  
+  // Job details
+  startDate    DateTime?
+  endDate      DateTime?
+  location     String?
+  requirements String?
+  payRate      Decimal?
+  currency     String    @default("GBP")
+  
+  // Metadata
+  metadata Json @default("{}")
+  
+  // Timestamps
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  // Relations
+  shifts     Shift[]
+  timesheets Timesheet[]
+  payments   Payment[]
+  
+  @@map("jobs")
+}
+
+model Shift {
+  id       String      @id @default(cuid())
+  title    String
+  status   ShiftStatus @default(SCHEDULED)
+  
+  // Assignment
+  workerId String
+  worker   User   @relation(fields: [workerId], references: [id])
+  jobId    String
+  job      Job    @relation(fields: [jobId], references: [id])
+  
+  // Organization
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  
+  // Timing
+  scheduledStart DateTime
+  scheduledEnd   DateTime
+  actualStart    DateTime?
+  actualEnd      DateTime?
+  breakDuration  Int?      @default(0) // minutes
+  
+  // Location (optional geostamps)
+  location     String?
+  latitude     Float?
+  longitude    Float?
+  clockInLat   Float?
+  clockInLng   Float?
+  clockOutLat  Float?
+  clockOutLng  Float?
+  
+  // Pay
+  hourlyRate Decimal?
+  currency   String  @default("GBP")
+  
+  // Notes
+  notes    String?
+  metadata Json   @default("{}")
+  
+  // Timestamps
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  // Relations
+  timesheets Timesheet[]
+  
+  @@map("shifts")
+}
+
+model Timesheet {
+  id     String          @id @default(cuid())
+  status TimesheetStatus @default(DRAFT)
+  
+  // Assignment
+  workerId String
+  worker   User   @relation(fields: [workerId], references: [id])
+  jobId    String
+  job      Job    @relation(fields: [jobId], references: [id])
+  shiftId  String?
+  shift    Shift? @relation(fields: [shiftId], references: [id])
+  
+  // Time tracking
+  clockIn     DateTime
+  clockOut    DateTime?
+  breakStart  DateTime?
+  breakEnd    DateTime?
+  totalHours  Decimal?
+  billableHours Decimal?
+  
+  // Location tracking
+  clockInLocation  String?
+  clockOutLocation String?
+  clockInLat       Float?
+  clockInLng       Float?
+  clockOutLat      Float?
+  clockOutLng      Float?
+  
+  // Pay calculation
+  hourlyRate    Decimal?
+  overtimeRate  Decimal?
+  totalPay      Decimal?
+  currency      String  @default("GBP")
+  
+  // Approval
+  submittedAt DateTime?
+  approvedAt  DateTime?
+  approvedBy  String?
+  rejectedAt  DateTime?
+  rejectionReason String?
+  
+  // Notes and metadata
+  notes    String?
+  metadata Json   @default("{}")
+  
+  // Timestamps
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@map("timesheets")
+}
+
+model Payment {
+  id     String        @id @default(cuid())
+  status PaymentStatus @default(PENDING)
+  
+  // Payment details
+  amount       Decimal
+  currency     String @default("GBP")
+  description  String?
+  
+  // Recipients
+  recipientId String
+  recipient   User   @relation("PaymentRecipient", fields: [recipientId], references: [id])
+  
+  // Related entities
+  jobId String?
+  job   Job?   @relation(fields: [jobId], references: [id])
+  
+  // Organization
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  
+  // Stripe integration
+  stripePaymentIntentId String?
+  stripeTransferId      String?
+  stripeChargeId        String?
+  
+  // Processing
+  processedAt DateTime?
+  failedAt    DateTime?
+  failureReason String?
+  
+  // Compliance & reporting
+  taxWithheld    Decimal? @default(0)
+  niContribution Decimal? @default(0)
+  
+  // Metadata
+  metadata Json @default("{}")
+  
+  // Timestamps
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@map("payments")
+}
+
+model AuditLog {
+  id       String @id @default(cuid())
+  action   String
+  entity   String
+  entityId String
+  
+  // User context
+  userId String?
+  user   User?  @relation(fields: [userId], references: [id])
+  
+  // Organization context
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  
+  // Change details
+  oldValues Json?
+  newValues Json?
+  metadata  Json @default("{}")
+  
+  // Request context
+  ipAddress String?
+  userAgent String?
+  
+  // Timestamp
+  createdAt DateTime @default(now())
+  
+  @@map("audit_logs")
+}
