@@ -1,0 +1,36 @@
+You are a senior full-stack engineer. Build “Kin2 Workforce” as a production-ready monorepo.
+
+Tech: Next.js 14 (App Router, TS), Node.js/Express API, PostgreSQL (Prisma), Stripe Connect (standard & Express), Clerk or NextAuth (email/password + OAuth), Expo push (placeholder server), Zod, Tailwind, shadcn/ui, Recharts. Monorepo via pnpm workspaces: apps/web, apps/api, packages/ui, packages/config.
+
+Features:
+1) Auth (users: worker, client, admin). RBAC middleware & server-side protection.
+2) Jobs, Shifts, Timesheets (CRUD + status flow, geostamps optional).
+3) Admin Dashboard: filters, weekly calendar, approvals, CSV exports, simple charts.
+4) Payments: create Stripe Connect accounts, payout flow, webhooks, test data.
+5) Compliance: HMRC-style CSV exports, PDF payslip generator (server route).
+6) Reporting: downloadable CSV/PDF for jobs, shifts, payouts.
+7) Settings: multi-tenant orgs (basic), SIC/NAICS metadata fields.
+8) Notifications: email templates + placeholder Expo push endpoint.
+9) Audit logs for sensitive actions.
+10) Docs: README with setup; .env.example for all services.
+
+Deliverables:
+- pnpm monorepo with Turbo tasks; `pnpm dev` to run web+api with hot reload.
+- Prisma schema + migrations + seed script.
+- REST routes for /api/auth, /api/jobs, /api/shifts, /api/timesheets, /api/payments, /api/reports.
+- Stripe webhook handler with test events.
+- Reusable UI in packages/ui; design clean, accessible, mobile-first.
+- Dockerfiles (web, api) + docker-compose for Postgres.
+- CI: basic test on push.
+- Scripts: dev, build, start, lint, test, db:push, db:seed.
+
+Steps:
+1) Init monorepo, workspace layout, shared tsconfig.
+2) Scaffold Next.js app (App Router) with protected routes and shadcn.
+3) Scaffold Express API with Zod validation and Prisma.
+4) Integrate Stripe Connect + webhooks + mock payout flow.
+5) Build Jobs/Shifts/Timesheets schemas, APIs, and dashboard pages.
+6) Implement exports (CSV/PDF) and audit logs.
+7) Provide seed data and a “Getting Started” README with commands.
+
+Output final folder tree, all env keys in .env.example, and instructions to run locally on Replit.
