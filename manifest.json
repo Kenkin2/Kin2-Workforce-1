@@ -1,0 +1,99 @@
+{
+  "name": "Kin2 Workforce - Enterprise Platform",
+  "short_name": "Kin2 Workforce",
+  "description": "Next-generation enterprise workforce management platform for modern businesses",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#0066cc",
+  "orientation": "portrait-primary",
+  "scope": "/",
+  "icons": [
+    {
+      "src": "/assets/Kin2_Workforce_circular_emblem_364ffd7e-DynPhJXK.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/assets/Kin2_Workforce_professional_logo_f8fd9064-DztFhk63.png",
+      "sizes": "217x217",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ],
+  "categories": ["business", "productivity", "finance"],
+  "screenshots": [
+    {
+      "src": "/assets/Analytics_dashboard_illustration_14a1a93e-CcwI0_G_.png",
+      "sizes": "1067x1067",
+      "type": "image/png",
+      "form_factor": "wide"
+    }
+  ],
+  "share_target": {
+    "action": "/share",
+    "method": "POST",
+    "enctype": "multipart/form-data",
+    "params": {
+      "title": "title",
+      "text": "text",
+      "url": "url",
+      "files": [
+        {
+          "name": "media",
+          "accept": ["image/*", "application/pdf"]
+        }
+      ]
+    }
+  },
+  "shortcuts": [
+    {
+      "name": "Dashboard",
+      "short_name": "Home",
+      "description": "View your workforce dashboard",
+      "url": "/home",
+      "icons": [{ "src": "/assets/Kin2_Workforce_circular_emblem_364ffd7e-DynPhJXK.png", "sizes": "512x512" }]
+    },
+    {
+      "name": "Jobs",
+      "short_name": "Jobs",
+      "description": "Manage job postings",
+      "url": "/jobs",
+      "icons": [{ "src": "/assets/Kin2_Workforce_circular_emblem_364ffd7e-DynPhJXK.png", "sizes": "512x512" }]
+    },
+    {
+      "name": "Schedule",
+      "short_name": "Schedule",
+      "description": "View shift schedules",
+      "url": "/schedule",
+      "icons": [{ "src": "/assets/Kin2_Workforce_circular_emblem_364ffd7e-DynPhJXK.png", "sizes": "512x512" }]
+    },
+    {
+      "name": "Timesheets",
+      "short_name": "Time",
+      "description": "Track time and attendance",
+      "url": "/timesheets",
+      "icons": [{ "src": "/assets/Kin2_Workforce_circular_emblem_364ffd7e-DynPhJXK.png", "sizes": "512x512" }]
+    }
+  ],
+  "prefer_related_applications": false,
+  "related_applications": [
+    {
+      "platform": "play",
+      "url": "https://play.google.com/store/apps/details?id=com.kin2.workforce",
+      "id": "com.kin2.workforce"
+    },
+    {
+      "platform": "itunes",
+      "url": "https://apps.apple.com/app/kin2-workforce/id123456789"
+    }
+  ],
+  "features": [
+    "Cross-platform availability (Web, Desktop, Mobile)",
+    "Offline functionality",
+    "Push notifications",
+    "Background sync",
+    "Device integration (camera, GPS, biometrics)"
+  ]
+}

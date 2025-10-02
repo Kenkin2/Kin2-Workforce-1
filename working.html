@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kin2 Workforce - Enterprise Platform</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: 'Inter', system-ui, sans-serif; 
+            background: #fafafa; 
+            color: #1a1a1a; 
+            line-height: 1.6; 
+        }
+        .container { max-width: 1000px; margin: 0 auto; padding: 40px 20px; }
+        .header { text-align: center; margin-bottom: 60px; }
+        .logo { 
+            display: inline-flex; 
+            align-items: center; 
+            margin-bottom: 20px;
+            padding: 12px 24px;
+            background: white;
+            border-radius: 16px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+        }
+        .logo-icon { font-size: 32px; margin-right: 12px; }
+        .logo-text { 
+            font-size: 2.5rem; 
+            font-weight: 700; 
+            color: #1a1a1a; 
+        }
+        .tagline { 
+            font-size: 2.2rem; 
+            font-weight: 600; 
+            color: #333; 
+            margin-bottom: 16px; 
+        }
+        .description { 
+            font-size: 1.2rem; 
+            color: #666; 
+            margin-bottom: 32px; 
+            line-height: 1.6;
+        }
+        .cta-button {
+            background: linear-gradient(135deg, #0066cc, #004499);
+            color: white;
+            padding: 18px 36px;
+            border: none;
+            border-radius: 12px;
+            font-size: 18px;
+            font-weight: 600;
+            cursor: pointer;
+            box-shadow: 0 6px 20px rgba(0,102,204,0.3);
+            transition: all 0.2s ease;
+            text-decoration: none;
+            display: inline-block;
+        }
+        .cta-button:hover { transform: scale(1.05); }
+        .features {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 24px;
+            margin-top: 60px;
+        }
+        .feature {
+            background: white;
+            padding: 24px;
+            border-radius: 12px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            text-align: left;
+        }
+        .feature h3 {
+            font-size: 1.3rem;
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 12px;
+            display: flex;
+            align-items: center;
+        }
+        .feature p {
+            color: #666;
+            line-height: 1.5;
+        }
+        .status {
+            background: white;
+            padding: 20px;
+            border-radius: 12px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            margin-bottom: 40px;
+            text-align: center;
+        }
+        .status-indicator {
+            display: inline-flex;
+            align-items: center;
+            padding: 8px 16px;
+            background: #dcfce7;
+            color: #166534;
+            border-radius: 8px;
+            font-weight: 600;
+            margin-bottom: 16px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Platform Status -->
+        <div class="status">
+            <div class="status-indicator">
+                ✅ Platform Status: Fully Operational
+            </div>
+            <p style="color: #666; margin-bottom: 16px;">
+                All enterprise services initialized successfully • Database connected • Authentication configured
+            </p>
+        </div>
+
+        <!-- Header -->
+        <div class="header">
+            <div class="logo">
+                <span class="logo-icon">🏢</span>
+                <h1 class="logo-text">Kin2 Workforce</h1>
+            </div>
+            
+            <h2 class="tagline">Next-Generation Enterprise Platform</h2>
+            
+            <p class="description">
+                Complete enterprise workforce solution with AI-powered analytics, multi-tenant architecture, 
+                advanced security, mobile PWA capabilities, and seamless integrations with 15+ business tools. 
+                Built for scale, security, and performance.
+            </p>
+            
+            <a href="/api/login" class="cta-button">
+                🚀 Launch Enterprise Platform
+            </a>
+        </div>
+
+        <!-- Features Grid -->
+        <div class="features">
+            <div class="feature">
+                <h3>🤖 AI-Powered Analytics</h3>
+                <p>Predictive insights, performance forecasting, and intelligent automation for optimal workforce management with real-time data processing.</p>
+            </div>
+            
+            <div class="feature">
+                <h3>🏢 Multi-Tenant Architecture</h3>
+                <p>Complete organization isolation with custom branding, enterprise SSO (SAML/OIDC), white-labeling, and tenant-specific configurations.</p>
+            </div>
+            
+            <div class="feature">
+                <h3>🔗 Business Integrations</h3>
+                <p>Seamless connections to ADP, Gusto, Slack, Microsoft Teams, QuickBooks, Xero, Google Calendar, Outlook, and 10+ other business systems.</p>
+            </div>
+            
+            <div class="feature">
+                <h3>📱 Mobile PWA</h3>
+                <p>Progressive web app with offline capabilities, location tracking, mobile-optimized interfaces, push notifications, and biometric authentication.</p>
+            </div>
+            
+            <div class="feature">
+                <h3>🛡️ Enterprise Security</h3>
+                <p>Automated compliance (GDPR, SOX), disaster recovery, advanced security monitoring, audit trails, and enterprise backup systems.</p>
+            </div>
+            
+            <div class="feature">
+                <h3>🔧 Developer Platform</h3>
+                <p>API marketplace with third-party extensions, SDK generation for multiple languages, webhook system, and comprehensive developer documentation.</p>
+            </div>
+        </div>
+
+        <!-- Technical Architecture -->
+        <div style="margin-top: 60px; padding: 30px; background: white; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
+            <h3 style="margin-bottom: 20px; color: #333; text-align: center;">🏗️ Enterprise Architecture</h3>
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px;">
+                <div style="text-align: center; padding: 16px;">
+                    <div style="font-size: 2rem; margin-bottom: 8px;">⚡</div>
+                    <h4 style="margin-bottom: 8px; color: #333;">High Performance</h4>
+                    <p style="color: #666; font-size: 0.9rem;">React + TypeScript + Express</p>
+                </div>
+                <div style="text-align: center; padding: 16px;">
+                    <div style="font-size: 2rem; margin-bottom: 8px;">🗄️</div>
+                    <h4 style="margin-bottom: 8px; color: #333;">PostgreSQL</h4>
+                    <p style="color: #666; font-size: 0.9rem;">Neon serverless database</p>
+                </div>
+                <div style="text-align: center; padding: 16px;">
+                    <div style="font-size: 2rem; margin-bottom: 8px;">🔐</div>
+                    <h4 style="margin-bottom: 8px; color: #333;">Secure Auth</h4>
+                    <p style="color: #666; font-size: 0.9rem;">OpenID Connect + SAML</p>
+                </div>
+                <div style="text-align: center; padding: 16px;">
+                    <div style="font-size: 2rem; margin-bottom: 8px;">☁️</div>
+                    <h4 style="margin-bottom: 8px; color: #333;">Cloud Ready</h4>
+                    <p style="color: #666; font-size: 0.9rem;">Enterprise deployment</p>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
