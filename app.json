@@ -1,0 +1,58 @@
+{
+  "expo": {
+    "name": "Kin2 Workforce",
+    "slug": "kin2-workforce",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./attached_assets/Kin2_Workforce_circular_emblem_364ffd7e.png",
+    "userInterfaceStyle": "automatic",
+    "splash": {
+      "image": "./attached_assets/Kin2_Workforce_professional_logo_f8fd9064.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#ffffff"
+    },
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.kin2.workforce",
+      "buildNumber": "1.0.0",
+      "infoPlist": {
+        "NSCameraUsageDescription": "This app needs camera access for job documentation and worker verification.",
+        "NSPhotoLibraryUsageDescription": "This app needs photo library access to upload documents and images.",
+        "NSLocationWhenInUseUsageDescription": "This app needs location access for GPS-based check-in/check-out and job tracking."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./attached_assets/Kin2_Workforce_circular_emblem_364ffd7e.png",
+        "backgroundColor": "#ffffff"
+      },
+      "package": "com.kin2.workforce",
+      "versionCode": 1,
+      "permissions": [
+        "CAMERA",
+        "READ_EXTERNAL_STORAGE",
+        "WRITE_EXTERNAL_STORAGE",
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION",
+        "INTERNET"
+      ]
+    },
+    "web": {
+      "favicon": "./attached_assets/Kin2_Workforce_circular_emblem_364ffd7e.png",
+      "bundler": "metro"
+    },
+    "plugins": [
+      "expo-router"
+    ],
+    "scheme": "kin2workforce",
+    "extra": {
+      "apiUrl": "https://workforce-kin2serviceslim.replit.app",
+      "eas": {
+        "projectId": "your-project-id"
+      }
+    }
+  }
+}
