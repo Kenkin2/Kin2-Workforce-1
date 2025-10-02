@@ -1,0 +1,58 @@
+openapi: 3.0.3
+info:
+  title: Kin2 Workforce API
+  version: 0.1.0
+servers:
+  - url: http://localhost:8080
+paths:
+  /healthz:
+    get:
+      summary: Liveness probe
+      responses:
+        '200': { description: OK }
+  /readyz:
+    get:
+      summary: Readiness probe
+      responses:
+        '200': { description: Ready }
+  /api/auth/login:
+    post:
+      summary: Login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                email: { type: string, format: email }
+                password: { type: string, format: password }
+      responses:
+        '200': { description: Logged in }
+  /api/jobs:
+    get:
+      summary: List jobs
+      parameters:
+        - in: query
+          name: q
+          schema: { type: string }
+      responses:
+        '200':
+          description: Jobs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Job'
+components:
+  schemas:
+    Job:
+      type: object
+      properties:
+        id: { type: string }
+        title: { type: string }
+        startTime: { type: string, format: date-time }
+        endTime: { type: string, format: date-time }
+        location: { type: string }
+        rate: { type: number }

@@ -1,62 +1,24 @@
-version: '3.8'
-
+version: "3.9"
 services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: kin2
+      POSTGRES_PASSWORD: kin2
+      POSTGRES_DB: kin2
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+
   app:
     build: .
-    ports:
-      - "5000:5000"
+    depends_on: [db]
+    env_file: .env
     environment:
-      - NODE_ENV=production
-      - DATABASE_URL=${DATABASE_URL}
-      - SESSION_SECRET=${SESSION_SECRET}
-      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY}
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - VITE_STRIPE_PUBLIC_KEY=${VITE_STRIPE_PUBLIC_KEY}
-    depends_on:
-      - db
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-
-  db:
-    image: postgres:15-alpine
-    environment:
-      POSTGRES_DB: kin2_workforce
-      POSTGRES_USER: ${POSTGRES_USER:-kin2user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./backups:/backups
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-kin2user}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  redis:
-    image: redis:7-alpine
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-
-  nginx:
-    image: nginx:alpine
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf
-      - ./ssl:/etc/ssl/certs
-    depends_on:
-      - app
-    restart: unless-stopped
+      DATABASE_URL: postgres://kin2:kin2@db:5432/kin2
+      NODE_ENV: development
+      PORT: 8080
+    ports: ["8080:8080"]
+    command: ["npm","run","start:dev"]
 
 volumes:
-  postgres_data:
+  pgdata:
