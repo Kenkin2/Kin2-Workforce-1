@@ -1,34 +1,153 @@
 {
-  "name": "Kin2 Workforce - Enterprise Platform",
+  "name": "Kin2 Workforce Management Platform",
   "short_name": "Kin2 Workforce",
-  "description": "Next-generation enterprise workforce management platform for modern businesses",
+  "description": "Next-generation enterprise workforce management platform with AI-powered analytics, offline capabilities, push notifications, and advanced security",
   "start_url": "/",
   "display": "standalone",
+  "theme_color": "#3b82f6",
   "background_color": "#ffffff",
-  "theme_color": "#0066cc",
   "orientation": "portrait-primary",
   "scope": "/",
+  "lang": "en",
+  "categories": ["business", "productivity", "utilities", "finance", "education"],
+  "screenshots": [
+    {
+      "src": "/screenshots/desktop-1.png",
+      "sizes": "1280x720",
+      "type": "image/png",
+      "platform": "wide",
+      "label": "Dashboard view on desktop"
+    },
+    {
+      "src": "/screenshots/mobile-1.png",
+      "sizes": "375x812",
+      "type": "image/png",
+      "platform": "narrow",
+      "label": "Mobile dashboard"
+    }
+  ],
   "icons": [
     {
-      "src": "/assets/Kin2_Workforce_circular_emblem_364ffd7e-DynPhJXK.png",
-      "sizes": "512x512",
+      "src": "/icons/icon-72x72.png",
+      "sizes": "72x72",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-96x96.png",
+      "sizes": "96x96",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-128x128.png",
+      "sizes": "128x128",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-144x144.png",
+      "sizes": "144x144",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-152x152.png",
+      "sizes": "152x152",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-192x192.png",
+      "sizes": "192x192",
       "type": "image/png",
       "purpose": "any maskable"
     },
     {
-      "src": "/assets/Kin2_Workforce_professional_logo_f8fd9064-DztFhk63.png",
-      "sizes": "217x217",
+      "src": "/icons/icon-384x384.png",
+      "sizes": "384x384",
       "type": "image/png",
       "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
     }
   ],
-  "categories": ["business", "productivity", "finance"],
-  "screenshots": [
+  "shortcuts": [
     {
-      "src": "/assets/Analytics_dashboard_illustration_14a1a93e-CcwI0_G_.png",
-      "sizes": "1067x1067",
-      "type": "image/png",
-      "form_factor": "wide"
+      "name": "Dashboard",
+      "short_name": "Dashboard",
+      "description": "View workforce dashboard",
+      "url": "/",
+      "icons": [
+        {
+          "src": "/icons/shortcut-dashboard.png",
+          "sizes": "96x96"
+        }
+      ]
+    },
+    {
+      "name": "Jobs",
+      "short_name": "Jobs",
+      "description": "Manage jobs and assignments",
+      "url": "/jobs",
+      "icons": [
+        {
+          "src": "/icons/shortcut-jobs.png",
+          "sizes": "96x96"
+        }
+      ]
+    },
+    {
+      "name": "Schedule",
+      "short_name": "Schedule",
+      "description": "View and manage schedules",
+      "url": "/schedule",
+      "icons": [
+        {
+          "src": "/icons/shortcut-schedule.png",
+          "sizes": "96x96"
+        }
+      ]
+    },
+    {
+      "name": "AI Assistant",
+      "short_name": "AI",
+      "description": "Access AI-powered workforce insights",
+      "url": "/ai",
+      "icons": [
+        {
+          "src": "/icons/shortcut-ai.png",
+          "sizes": "96x96"
+        }
+      ]
+    },
+    {
+      "name": "Quick Clock In",
+      "short_name": "Clock In",
+      "description": "Quickly clock in to your shift",
+      "url": "/timesheets?action=clockin",
+      "icons": [
+        {
+          "src": "/icons/shortcut-clockin.png",
+          "sizes": "96x96"
+        }
+      ]
+    },
+    {
+      "name": "Learning Hub",
+      "short_name": "Learning",
+      "description": "Access courses and training",
+      "url": "/learning",
+      "icons": [
+        {
+          "src": "/icons/shortcut-learning.png",
+          "sizes": "96x96"
+        }
+      ]
     }
   ],
   "share_target": {
@@ -41,59 +160,45 @@
       "url": "url",
       "files": [
         {
-          "name": "media",
-          "accept": ["image/*", "application/pdf"]
+          "name": "files",
+          "accept": ["image/*", "application/pdf", ".doc", ".docx"]
         }
       ]
     }
   },
-  "shortcuts": [
+  "protocol_handlers": [
     {
-      "name": "Dashboard",
-      "short_name": "Home",
-      "description": "View your workforce dashboard",
-      "url": "/home",
-      "icons": [{ "src": "/assets/Kin2_Workforce_circular_emblem_364ffd7e-DynPhJXK.png", "sizes": "512x512" }]
-    },
-    {
-      "name": "Jobs",
-      "short_name": "Jobs",
-      "description": "Manage job postings",
-      "url": "/jobs",
-      "icons": [{ "src": "/assets/Kin2_Workforce_circular_emblem_364ffd7e-DynPhJXK.png", "sizes": "512x512" }]
-    },
-    {
-      "name": "Schedule",
-      "short_name": "Schedule",
-      "description": "View shift schedules",
-      "url": "/schedule",
-      "icons": [{ "src": "/assets/Kin2_Workforce_circular_emblem_364ffd7e-DynPhJXK.png", "sizes": "512x512" }]
-    },
-    {
-      "name": "Timesheets",
-      "short_name": "Time",
-      "description": "Track time and attendance",
-      "url": "/timesheets",
-      "icons": [{ "src": "/assets/Kin2_Workforce_circular_emblem_364ffd7e-DynPhJXK.png", "sizes": "512x512" }]
+      "protocol": "web+kin2workforce",
+      "url": "/handle?type=%s"
     }
   ],
+  "edge_side_panel": {
+    "preferred_width": 400
+  },
+  "launch_handler": {
+    "client_mode": "focus-existing"
+  },
+  "related_applications": [],
   "prefer_related_applications": false,
-  "related_applications": [
-    {
-      "platform": "play",
-      "url": "https://play.google.com/store/apps/details?id=com.kin2.workforce",
-      "id": "com.kin2.workforce"
-    },
-    {
-      "platform": "itunes",
-      "url": "https://apps.apple.com/app/kin2-workforce/id123456789"
-    }
-  ],
   "features": [
-    "Cross-platform availability (Web, Desktop, Mobile)",
-    "Offline functionality",
-    "Push notifications",
-    "Background sync",
-    "Device integration (camera, GPS, biometrics)"
-  ]
+    "offline-support",
+    "push-notifications",
+    "background-sync",
+    "geolocation",
+    "camera",
+    "microphone",
+    "biometric-authentication",
+    "screen-wake-lock",
+    "device-memory"
+  ],
+  "permissions": [
+    "notifications",
+    "geolocation",
+    "camera",
+    "microphone",
+    "background-sync",
+    "wake-lock"
+  ],
+  "id": "/",
+  "dir": "ltr"
 }

@@ -1,0 +1,24 @@
+{
+  "name": "@kin2/config",
+  "version": "0.0.1",
+  "private": true,
+  "main": "index.js",
+  "files": [
+    "eslint.js",
+    "tailwind.js",
+    "tsconfig.json"
+  ],
+  "devDependencies": {
+    "@types/eslint": "^8.56.0",
+    "@types/node": "^20.16.11",
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "eslint": "^8.57.0",
+    "eslint-config-next": "^14.2.3",
+    "eslint-config-prettier": "^9.1.0",
+    "eslint-plugin-react": "^7.34.1",
+    "eslint-plugin-react-hooks": "^4.6.0",
+    "tailwindcss": "^3.4.17",
+    "typescript": "^5.6.3"
+  }
+}
